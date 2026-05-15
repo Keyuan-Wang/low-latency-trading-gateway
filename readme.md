@@ -1,95 +1,145 @@
-```
-                        ┌─────────────────────────────┐
-                        │     Market Data Feed         │
-                        │ (Simulated external source)  │
-                        └─────────────┬───────────────┘
-                                      │ raw ticks
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                 MARKET DATA PIPELINE  (Module 2)                    │
-│                                                                     │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────────────┐   │
-│  │ SPSC Ring    │───▶│ Bloom Filter │───▶│ LRU Cache           │   │
-│  │ Buffer       │    │(dedup/replay │    │(unordered_map+list)  │   │
-│  │ (lfutils)    │    │ protection)  │    └──────────┬───────────┘   │
-│  └──────────────┘    └──────────────┘               │               │
-│                                              stale detection        │
-│                                         (alert if no tick for N ms) │
-└──────────────────────────────────────────────────────┬──────────────┘
-                                                       │ cleaned ticks
-                                                       ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                    MATCHING CORE  (Module 1)                         │
-│                                                                      │
-│  ┌──────────────────────────────────────────────────────────────┐    │
-│  │                  Order Book (Skip List)                      │    │
-│  │                                                              │    │
-│  │   Bid Side (Buy)           Ask Side (Sell)                   │    │
-│  │   Price▲ (High→Low)        Price▼ (Low→High)                 │    │
-│  │   ┌───┬──────┐              ┌───┬──────┐                     │    │
-│  │   │100│OrderA│              │101│OrderC│ ← each price level  │    │
-│  │   │   │OrderB│              │102│OrderD│   is an intrusive   │    │
-│  │   ├───┼──────┤              ├───┼──────┤   linked list       │    │
-│  │   │ 99│OrderE│              │103│OrderF│                     │    │
-│  │   └───┴──────┘              └───┴──────┘                     │    │
-│  └──────────────────────────────────────────────────────────────┘    │
-│                                                                      │
-│  Input: Limit Order / Market Order / Cancel Request                  │
-│  Output: Trade { buyer_id, seller_id, price, qty }                   │
-│  Memory: SoA layout + pmr pool (0 alloc/op on hot path)              │
-└──────────────────────────────────────┬───────────────────────────────┘
-                                       │ Trade event stream
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                   EXECUTION LAYER  (Module 3)                       │
-│                                                                     │
-│  ┌──────────────────┐                                               │
-│  │ Event Loop       │  consumes Trade events                        │
-│  │ priority_queue   │                                               │
-│  │ <Event>          │                                               │
-│  └────────┬─────────┘                                               │
-│           ▼                                                         │
-│  ┌──────────────────────────────────────────┐                       │
-│  │ Strategy Dispatch (std::variant + visit) │                       │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐  │                       │
-│  │  │ VWAP     │ │ TWAP     │ │ Grid     │  │                       │
-│  │  │ Strategy │ │ Strategy │ │ Strategy │  │                       │
-│  │  └──────────┘ └──────────┘ └──────────┘  │                       │
-│  └──────────────────────────────────────────┘                       │
-│           │                                                         │
-│           ▼                                                         │
-│  ┌──────────────┐                                                   │
-│  │ Risk Throttle│  order rate > threshold → circuit breaker + kill  │
-│  └──────────────┘                                                   │
-└──────────────────────────────────────┬──────────────────────────────┘
-                                       │ execution results
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                  RISK & SIMULATION  (Module 4)                      │
-│                                                                     │
-│  ┌──────────────────┐    ┌──────────────────┐    ┌──────────────┐   │
-│  │ tslib            │───▶│ Bootstrap       │───▶│ Reservoir    │   │
-│  │ rolling returns  │    │ resampling       │    │ Sampling     │   │
-│  │ (Welford's algo) │    │ (Monte Carlo)    │    │(online Top-K)│   │
-│  └──────────────────┘    │ → max drawdown   │    └──────────────┘   │
-│                          │   distribution   │                       │
-│                          └──────────────────┘                       │
-└─────────────────────────────────────────────────────────────────────┘
+# llmes — Low-Latency Matching & Execution Simulator
 
-═══════════════════════════════════════════════════════════════════════
-                      Support Libraries (header-only)
-═══════════════════════════════════════════════════════════════════════
+A C++20 simulator developed incrementally from correctness-first matching logic to later performance-focused redesigns.
 
-  ┌─────────────────────────┐      ┌─────────────────────────┐
-  │  tslib                  │      │  lfutils                │
-  │  (Time-Series Library)  │      │  (Lock-Free Utilities)  │
-  │                         │      │                         │
-  │  • Segment Tree         │      │  • SPSC Queue           │
-  │    (lazy propagation)   │      │  • Bounded Ring Buffer  │
-  │  • Fenwick Tree         │      │  • Object Pool (pmr)    │
-  │  • Welford online stats │      │  • Cache line isolation │
-  │  • Monotonic Deque      │      │    (alignas(64))        │
-  │    (sliding window)     │      │                         │
-  │  • Rolling Sharpe/MDD   │      │                         │
-  └─────────────────────────┘      └─────────────────────────┘
+**Current implementation scope: Phase 1 / Matching Core only.**
+
+---
+
+## Current Status
+
+| Area | Status |
+|------|--------|
+| Matching Core (Phase 1) | Done |
+| Data structure | `std::map<price, std::list<Order>>` (price level + FIFO queue) |
+| Order types | Limit / Market / Cancel |
+| Trade output | `Trade` + `AddResult` |
+| Failure-mode handling | pending-cancel, market remainder cancel, duplicate ID |
+| Unit tests | rest / match / market sweep / pending cancel |
+| Performance rewrite (Phase 2+) | Not started |
+| Market Data / Execution / Risk | Not started |
+| tslib / lfutils | Not started |
+
+---
+
+## What Is Implemented (Phase 1)
+
+Baseline central limit order book:
+
+- **Ask book:** ascending price; `begin()` = best ask
+- **Bid book:** descending price; `begin()` = best bid
+- **FIFO:** `std::list` per price level
+- **API:** `add_limit_order`, `add_market_order`, `cancel_order`
+- **Results:** `Trade`, `AddResult`, `ErrorCode`
+
+### Entry points
+
+- `core/matching_core/include/matching/order_book.hpp`
+- `core/matching_core/src/order_book.cpp`
+- `core/matching_core/tests/order_book_test.cpp`
+
+---
+
+## Build & Test
+
+**Requirements:** CMake >= 3.20, C++20 (GCC 13+ or Clang 16+ recommended)
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
 ```
+
+If you see `No test configuration file found`, run `ctest` with `--test-dir build` (or `cd build` then `ctest`).
+
+---
+
+## Phase 1 Behavior
+
+### Limit order
+
+- Matches opposite side while price crosses.
+- Remainder rests on the same side at limit price.
+- FIFO within each price level.
+
+### Market order
+
+- Consumes opposite liquidity until filled or book empty.
+- Unfilled remainder is not posted; returns `MarketRemainderCancelled`.
+
+### Cancel
+
+- Found on book -> removed, `Success`.
+- Not found -> `UnknownOrderId`, id added to pending-cancel set.
+- Later insert with same id -> `PendingCancelExists`.
+
+### Time Complexity
+
+#### Notation
+- `N`: total number of resting orders in the book (bid + ask).
+- `Pb` / `Pa`: number of price levels on bid / ask side.
+- `P`: number of price levels on the side touched by this operation (use `max(Pb, Pa)` for an upper bound).
+- `K`: number of maker orders actually visited/matched during this request.
+Assumption: `std::unordered_set` operations are average-case `O(1)` under normal hash distribution.
+---
+
+#### Time Complexity (Phase 1 Implementation)
+| Function | Time Complexity (average) | Notes |
+|---|---:|---|
+| `OrderBook()` | `O(1)` | Empty container initialization |
+| `pending_cancel_count()` | `O(1)` | `unordered_set::size()` |
+| `cancel_order()` | `O(N)` | Linear scan across both books (`map` levels + `list` queues) |
+| `add_limit_order()` | `O(K + log P)` | Match `K` makers; if remainder exists, insert into `map` level (`log P`) |
+| `add_market_order()` | `O(K)` | Match only; no remainder posting |
+| `can_cross_limit()` | `O(1)` | Single price comparison |
+---
+
+
+## Failure-Mode Coverage
+
+| Scenario | Behavior |
+|----------|----------|
+| Cancel before insert | Pending cancel; later insert rejected |
+| Duplicate order id | `DuplicateOrderId` |
+| Market sweeps book | Partial fill; remainder cancelled |
+
+---
+
+## Project Layout
+
+```text
+llmes/
+├── CMakeLists.txt
+├── core/
+│   └── matching_core/
+│       ├── CMakeLists.txt
+│       ├── include/matching/order_book.hpp
+│       ├── src/order_book.cpp
+│       └── tests/order_book_test.cpp
+└── build/          (generated)
+```
+
+---
+
+## Design Notes
+
+- Intentional minimal Phase 1 baseline (correctness first).
+- Cancel scans price levels (expected for this phase).
+- Later: intrusive list, id index, skip list, SoA, pmr, benchmarks.
+
+---
+
+## Roadmap
+
+1. Phase 1 (current): functional core + tests
+2. Phase 2: intrusive queue, O(1) cancel index, skip list
+3. Phase 3: SoA, cache alignment, pmr experiments
+4. Phase 4: perf / benchmark (p50/p99, LLC miss)
+5. Market data, execution, risk, tslib, lfutils
+
+---
+
+
+## Disclaimer
+
+README distinguishes implemented vs planned features as the project grows.

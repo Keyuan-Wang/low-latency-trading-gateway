@@ -58,6 +58,18 @@ int main() {
         expect(r.code == matching::ErrorCode::PendingCancelExists, "blocked by pending cancel");
     }
 
+    // 5. duplicate order id rejected
+    {
+        matching::OrderBook b;
+        const auto first = b.add_limit_order(7, matching::Side::Buy, 100, 10, 1);
+        expect(first.code == matching::ErrorCode::Success, "first insert ok");
+
+        const auto dup = b.add_limit_order(7, matching::Side::Sell, 101, 5, 2);
+        expect(dup.code == matching::ErrorCode::DuplicateOrderId, "duplicate rejected");
+        expect(dup.remaining_quantity == 5, "full qty returned as remaining");
+        expect(dup.trades.empty(), "no trades on duplicate");
+    }
+
     std::cout << "order_book tests passed\n";
     return 0;
 }
