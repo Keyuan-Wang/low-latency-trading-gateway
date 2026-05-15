@@ -1,6 +1,8 @@
 build/
 cmake-build-*/
 .venv/
+bench/
+
 *.o
 *.obj
 *.exe
