@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(LLMES_BUILD_TESTS "Build tests" ON)
+option(LLMES_BUILD_BENCHMARKS "Build benchmarks" ON)
 
 if(LLMES_BUILD_TESTS)
   enable_testing()
