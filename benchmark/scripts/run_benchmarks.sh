@@ -16,7 +16,7 @@ if (( DRY_RUN == 0 )); then
   cmake --build "$ROOT/build" -j
 fi
 
-SCENARIOS_CSV="${SCENARIOS:-lmt_rest,lmt_cross_deep,mkt_sweep_deep,cxl_miss,dup_reject}"
+SCENARIOS_CSV="${SCENARIOS:-lmt_rest,lmt_cross_deep,lmt_cross_shallow,mkt_sweep_deep,cxl_miss,cxl_hit,dup_reject}"
 METRICS_CSV="${METRICS:-latency,pmc}"
 ORDERS_CSV="${ORDERS:-1000,10000,100000}"
 LEVELS_CSV="${LEVELS:-10,100,1000}"
@@ -64,6 +64,8 @@ bin_for_scenario() {
     mkt_sweep_deep) echo "$ROOT/build/benchmark/bench_mkt_sweep_deep" ;;
     cxl_miss) echo "$ROOT/build/benchmark/bench_cxl_miss" ;;
     dup_reject) echo "$ROOT/build/benchmark/bench_dup_reject" ;;
+    cxl_hit) echo "$ROOT/build/benchmark/bench_cxl_hit" ;;
+    lmt_cross_shallow) echo "$ROOT/build/benchmark/bench_lmt_cross_shallow" ;;
     *)
       echo "unknown scenario: $1" >&2
       return 1

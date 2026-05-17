@@ -33,6 +33,16 @@ add_executable(bench_dup_reject
 )
 target_link_libraries(bench_dup_reject PRIVATE benchmark_runner_lib)
 
+add_executable(bench_cxl_hit
+  src/bench_cxl_hit.cpp
+)
+target_link_libraries(bench_cxl_hit PRIVATE benchmark_runner_lib)
+
+add_executable(bench_lmt_cross_shallow
+  src/bench_lmt_cross_shallow.cpp
+)
+target_link_libraries(bench_lmt_cross_shallow PRIVATE benchmark_runner_lib)
+
 # Smoke test: validates runner infrastructure (ParseArgs, CSV output, etc.)
 add_executable(benchmark_smoke_test
   tests/benchmark_smoke_test.cpp

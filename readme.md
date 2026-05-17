@@ -16,7 +16,7 @@ A C++20 simulator developed incrementally from correctness-first matching logic 
 | Trade output | `Trade` + `AddResult` |
 | Failure-mode handling | pending-cancel, market remainder cancel, duplicate ID |
 | Unit tests | rest / match / market sweep / pending cancel |
-| Benchmark harness | 5 scenarios x latency+PMC, version comparison plots |
+| Benchmark harness | 7 scenarios x latency+PMC, version comparison plots |
 | Performance rewrite (Phase 2+) | Planned |
 | Market Data / Execution / Risk | Not started |
 | tslib / lfutils | Not started |
@@ -101,8 +101,10 @@ measurement harness (`benchmark_runner.cpp`) has no knowledge of individual scen
 | Scenario | Prefill | Measured operation | What it stresses |
 |---|---|---|---|
 | `lmt_rest` | Empty book | Insert non-crossing buy limit | Resting limit insert path |
+| `lmt_cross_shallow` | Sell book, spread across `levels` | Buy limit crossing only first 3 levels | Partial-match + remainder-insert path |
 | `lmt_cross_deep` | Sell book, spread across `levels` | Aggressive buy limit crossing all levels | Price-time priority queue matching cost |
 | `mkt_sweep_deep` | Sell book, spread across `levels` | Buy market order sweeping all levels | Sequential matching + queue removal |
+| `cxl_hit` | Sell book, spread across `levels` | Cancel an order known to exist | Successful cancel hot path |
 | `cxl_miss` | Sell book, spread across `levels` | Cancel non-existent order ID | Worst-case cancel lookup (hash miss) |
 | `dup_reject` | Sell book + one resting buy (ID=7) | Insert duplicate order ID=7 | Duplicate-detection lookup path |
 
@@ -274,7 +276,9 @@ llmes/
 │   │   ├── bench_common.hpp
 │   │   ├── bench_lmt_rest.cpp
 │   │   ├── bench_lmt_cross_deep.cpp
+│   │   ├── bench_lmt_cross_shallow.cpp
 │   │   ├── bench_mkt_sweep_deep.cpp
+│   │   ├── bench_cxl_hit.cpp
 │   │   ├── bench_cxl_miss.cpp
 │   │   └── bench_dup_reject.cpp
 │   ├── runner/

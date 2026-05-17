@@ -22,9 +22,10 @@ class LmtCrossDeepScenario : public benchmark_runner::IBenchScenario {
     matching::OrderBook book;
     const std::uint64_t base = 200'000ULL + op_idx * 10'000ULL;
     benchmark_runner::PrefillSellBook(book, args.orders, args.levels, base);
-    const auto res = book.add_limit_order(base + 1, matching::Side::Buy, 5000,
+    const std::uint64_t buy_id = base + args.orders + args.levels + 100;
+    const auto res = book.add_limit_order(buy_id, matching::Side::Buy, 5000,
                                           static_cast<std::uint32_t>(args.levels),
-                                          base + 1);
+                                          buy_id);
     if (res.code == matching::ErrorCode::Success) ++ok;
     return true;
   }
