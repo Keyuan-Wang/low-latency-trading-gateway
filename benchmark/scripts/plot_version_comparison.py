@@ -7,23 +7,23 @@ generates comparison charts showing how performance evolved across
 different version_tag values for each scenario and metric.
 
 Plot types:
-  1. Line chart  — for each (scenario x metric), plot the metric against
+	1. Line chart  — for each (scenario x metric), plot the metric against
 	 the x-axis variable (default: orders), with one line per version_tag.
 	 CI error bars are shown when available.
-  2. Bar chart   — for each scenario, at a specific (orders, levels) config,
+	2. Bar chart   — for each scenario, at a specific (orders, levels) config,
 	 plot all metrics as a grouped bar per version_tag. Metrics are
 	 normalised relative to the first version so the direction of change
 	 is immediately visible.
 
 Usage (env vars):
-  AGG_CSV       Input aggregated CSV path (default: benchmark/results/*_merged_agg.csv)
-  SCENARIOS     Comma-separated scenario filter (default: all)
-  PLOT_METRICS  Comma-separated metrics to plot (default: p99_ns,ops_s,cpi,cache_misses_per_op)
-  X_COL         X-axis column (default: orders)
-  PLOT_LEVEL    Filter by levels value (default: first available)
-  FIXED_ORDERS  For the bar chart, fix orders to this value (default: none)
-  PLOT_OUT_DIR  Output directory for PNG files (default: benchmark/results/plots)
-  LOGX          Use log x-axis (default: 1)
+	AGG_CSV       Input aggregated CSV path (default: benchmark/results/*_merged_agg.csv)
+	SCENARIOS     Comma-separated scenario filter (default: all)
+	PLOT_METRICS  Comma-separated metrics to plot (default: p99_ns,ops_s,cpi,cache_misses_per_op)
+	X_COL         X-axis column (default: orders)
+	PLOT_LEVEL    Filter by levels value (default: first available)
+	FIXED_ORDERS  For the bar chart, fix orders to this value (default: none)
+	PLOT_OUT_DIR  Output directory for PNG files (default: benchmark/results/plots)
+	LOGX          Use log x-axis (default: 1)
 """
 
 import os
@@ -340,31 +340,43 @@ def make_heatmap() -> list[Path]:
 			continue
 
 		# Rename columns for display
-		hm = hm.rename(columns={m: METRIC_META.get(m, {}).get("label", m) for m in hm.columns})
+		label_map = {m: METRIC_META.get(m, {}).get("label", m) for m in hm.columns}
+		hm = hm.rename(columns=label_map)
 
-		fig, ax = plt.subplots(figsize=(max(6, len(hm.columns) * 2.2), max(3, len(hm) * 0.8)))
+		n_rows = len(hm)
+		n_cols = len(hm.columns)
+		cell_w = 1.8
+		cell_h = 0.95
+		fig, ax = plt.subplots(figsize=(max(6, n_cols * cell_w + 2), max(2.5, n_rows * cell_h + 1.2)))
 		im = ax.imshow(hm.values, cmap="RdYlGn_r", aspect="auto", vmin=-20, vmax=20)
 
-		ax.set_xticks(range(len(hm.columns)))
-		ax.set_xticklabels(hm.columns, fontsize=9)
-		ax.set_yticks(range(len(hm)))
+		ax.set_xticks(range(n_cols))
+		ax.set_xticklabels(hm.columns, fontsize=8, rotation=25, ha="right")
+		ax.xaxis.tick_top()
+		ax.set_yticks(range(n_rows))
 		ax.set_yticklabels(hm.index, fontsize=9)
-		ax.set_title(f"{scenario}: % change vs {versions[0]}")
+
+		# Border around cells so adjacent similar-colour cells are distinguishable
+		for r in range(n_rows):
+			for c in range(n_cols):
+				ax.add_patch(plt.Rectangle((c - 0.5, r - 0.5), 1, 1,
+				                           fill=False, edgecolor="white", lw=1.2))
 
 		# Annotate cells
-		for r in range(len(hm)):
-			for c in range(len(hm.columns)):
+		for r in range(n_rows):
+			for c in range(n_cols):
 				val = hm.values[r, c]
 				if not np.isnan(val):
 					ax.text(c, r, f"{val:+.1f}%", ha="center", va="center",
-							fontsize=8, fontweight="bold",
+							fontsize=7.5, fontweight="bold",
 							color="white" if abs(val) > 12 else "black")
 
-		plt.colorbar(im, ax=ax, label="% change vs baseline", shrink=0.8)
+		ax.set_title(f"{scenario}: % change vs {versions[0]}", fontsize=11, pad=18)
+		plt.colorbar(im, ax=ax, label="% change vs baseline", shrink=0.85, pad=0.02)
 		fig.tight_layout()
 
 		path = plot_dir / f"{scenario}_pct_change_heatmap.png"
-		fig.savefig(path)
+		fig.savefig(path, dpi=200, bbox_inches="tight")
 		plt.close(fig)
 		files.append(path)
 
