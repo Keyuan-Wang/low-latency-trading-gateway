@@ -12,5 +12,6 @@ __pycache__/
 *.out
 *.a
 *.so
+.clangd
 .DS_Store
 /TIMELINE.md

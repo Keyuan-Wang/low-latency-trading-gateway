@@ -6,9 +6,10 @@
 #pragma once
 
 #include <cstdint>
-#include <unordered_map>
 #include <unordered_set>
 #include <map>
+
+#include "absl/container/flat_hash_map.h"
 
 
 #include "types.hpp"
@@ -120,7 +121,7 @@ private:
 
     std::unordered_set<std::uint64_t> active_ids_{};         ///< Ids currently resting on book.
     std::unordered_set<std::uint64_t> pending_cancel_ids_{}; ///< Early cancel ids not yet seen on insert.
-    std::unordered_map<std::uint64_t, Order*> id_to_order_{};
+    absl::flat_hash_map<std::uint64_t, Order*> id_to_order_{};
 };
 
 }  // namespace matching
