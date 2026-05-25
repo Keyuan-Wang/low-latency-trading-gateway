@@ -204,7 +204,7 @@ for ((idx=0; idx<N; idx++)); do
   echo ""
   echo "========== [$((idx+1))/$N]  $commit  (tag: $tag) =========="
 
-  git checkout --detach "$commit"
+  git checkout "origin/$commit" 2>/dev/null || git checkout --detach "$commit"
   sha="$(git rev-parse --short HEAD)"
   COMMIT_SHAS+=("$sha")
   echo "  commit = $sha"
