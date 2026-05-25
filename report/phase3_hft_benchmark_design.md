@@ -274,6 +274,42 @@ No explicit depth profile is programmed — the exponential decay from the best 
 - **Output**: Same CSV format as existing benchmarks, enabling direct comparison with legacy results
 - **Reproducibility**: All randomness from `SplitMix64`, seeded from `args.seed + iter_idx * 9973` — identical to existing benchmarks
 
+#### Pre-generation Architecture: PendingOp
+
+The macro benchmark decouples event *generation* from event *execution*. During `Setup()` (untimed), all event parameters are pre-generated and stored in a `std::vector<PendingOp>`. During `RunOp()` (timed), the benchmark simply reads the next `PendingOp` from the vector and dispatches the corresponding `OrderBook` method:
+
+```
+Setup():
+  for i in 0..batch_size:
+    pending_.push_back(generate_one_event())
+
+RunOp(i):
+  switch pending_[i].type:
+    case kLimitAdd: book_->add_limit_order(pending_[i].params...)
+    case kCancel:   book_->cancel_order(pending_[i].id)
+    ...
+```
+
+This separation ensures the timed window measures only the matching engine — RNG draws, distribution sampling, and tracking-map bookkeeping happen before the clock starts.
+
+**Would the compiler optimize away the `pending_[i]` load?**
+
+No, for three reasons:
+
+1. **Opaque function calls**. `OrderBook` methods are defined in a separate translation unit (`order_book.cpp`). The compiler cannot prove that `book_->add_limit_order()` does not modify `pending_`. Every `pending_[i]` access must be a real memory load.
+
+2. **Virtual dispatch**. `RunOp()` is called through the virtual `IBenchScenario` interface. The compiler cannot inline across the virtual call boundary, so it cannot specialize the loop body around the concrete `PendingOp` type.
+
+3. **Side effects**. `OrderBook` operations modify the book's internal hash tables. The compiler cannot reorder or eliminate these writes, which cascade through the memory ordering.
+
+**What about the hardware prefetcher?**
+
+The `PendingOp` vector is laid out sequentially in memory. On the first `pending_[i]` access, the CPU's hardware prefetcher detects the stride pattern and begins pulling subsequent cache lines into L1. This reduces memory latency for PendingOp loads from ~60 cycles (L3 miss) to ~4 cycles (L1 hit). However, this is *realistic* — a production matching engine reading events from a ring buffer experiences identical prefetch behavior. The benchmark correctly reflects the memory subsystem performance of a production deployment.
+
+**Does sequential access miss cancellation clusters?**
+
+No. Cancel clusters are still executed as consecutive `RunOp()` calls — they are pre-generated as consecutive `PendingOp` entries of type `kCancel` targeting adjacent price levels. The prefetcher cannot exploit the cluster structure because each `PendingOp` still requires an independent `OrderBook` operation. The cluster's stress comes from consecutive erase operations on the same hash-table bucket chain, not from memory access patterns in the PendingOp vector.
+
 #### What the Macro Benchmark Captures That Current Benchmarks Miss
 
 | Feature | Current `bench_overall` | HFT macro |
