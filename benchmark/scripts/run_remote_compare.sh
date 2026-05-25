@@ -206,6 +206,31 @@ for ((idx=0; idx<N; idx++)); do
   COMMIT_SHAS+=("$sha")
   echo "  commit = $sha"
 
+  # Override CMakeLists.txt: force FetchContent with latest abseil tag.
+  # Old branches have GIT_TAG 20240722.0 which has linker issues on Debian.
+  cat > "$REMOTE_REPO_DIR/core/matching_core/CMakeLists.txt" << 'CMAKE_EOF'
+add_library(matching_core
+  src/order_book.cpp
+  src/order_pool.cpp
+)
+target_include_directories(matching_core
+  PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+include(FetchContent)
+FetchContent_Declare(abseil
+  GIT_REPOSITORY https://github.com/abseil/abseil-cpp.git
+  GIT_TAG 20260107.1
+)
+set(ABSL_PROPAGATE_CXX_STD ON)
+FetchContent_MakeAvailable(abseil)
+target_link_libraries(matching_core PUBLIC absl::flat_hash_map)
+if(LLMES_BUILD_TESTS)
+  add_executable(matching_core_tests tests/order_book_test.cpp)
+  target_link_libraries(matching_core_tests PRIVATE matching_core)
+  add_test(NAME matching_core_tests COMMAND matching_core_tests)
+endif()
+CMAKE_EOF
+
   # Rebuild — previous version's build dir may be incompatible
   rm -rf build
   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLMES_BUILD_BENCHMARKS=ON
