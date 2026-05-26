@@ -88,7 +88,7 @@ The macro measures throughput under the exact access pattern the engine experien
 
 Phase2e's 11.9M ops/s (+8.4% over baseline, +52% over 2c/2d) makes it the only phase besides baseline to reach double-digit M ops/s in the macro.
 
-Phase2e's 11.9M ops/s (+8.4% over baseline, +52% over 2c/2d) makes it the only phase besides baseline to reach double-digit M ops/s in the macro.
+![hft_macro comparison](hft_macro_comparison.png)
 
 ---
 
