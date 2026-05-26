@@ -141,7 +141,10 @@ int RunScenario(IBenchScenario& scenario, int argc, char** argv) {
 					static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 																			t1 - t0)
 																			.count());
-			latency_per_op_ns.push_back(ns / static_cast<double>(eff_batch));
+			const std::uint64_t norm = scenario.op_normalizer();
+			latency_per_op_ns.push_back(
+					ns / (static_cast<double>(eff_batch) *
+								static_cast<double>(norm > 0 ? norm : 1)));
 		} else {
 			std::array<std::uint64_t, 5> vals{};
 			if (!perf.ReadValues(vals)) return 3;

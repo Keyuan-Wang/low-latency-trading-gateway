@@ -100,6 +100,21 @@ class IBenchScenario {
 	 *        untimed.
 	 */
 	virtual void Teardown() = 0;
+
+	/**
+	 * @brief Normalization factor for the last RunOp() call.
+	 *
+	 * Defaults to 1 (one RunOp == one logical operation).  Scenarios where a
+	 * single RunOp performs internal work that should be reported on a
+	 * sub-operation basis (e.g. a market order that matches N orders) should
+	 * return the number of internal sub-operations performed in the most
+	 * recent RunOp() call.
+	 *
+	 * The runner divides the measured wall time by
+	 *   (eff_batch * op_normalizer())
+	 * so latency and ops/s reflect *per-sub-operation* cost.
+	 */
+	[[nodiscard]] virtual std::uint64_t op_normalizer() const { return 1; }
 };
 
 /**

@@ -19,6 +19,10 @@ public:
     const char* Name() const override { return "hft_market_large"; }
     [[nodiscard]] std::uint64_t max_batch_size() const override { return 1; }
 
+    [[nodiscard]] std::uint64_t op_normalizer() const override {
+        return last_filled_qty_;
+    }
+
     void Setup(const benchmark_runner::Args& args, std::uint64_t iter_idx) override {
         const std::uint64_t pool = args.orders + args.levels + 5000;
         book_ = std::make_unique<matching::OrderBook>(pool);
@@ -38,6 +42,7 @@ public:
         const std::uint64_t oid = id_counter_++;
         const auto res = book_->add_market_order(oid, matching::Side::Buy,
                                                  qty_, oid);
+        last_filled_qty_ = res.filled_quantity;
         if (res.code == matching::ErrorCode::Success ||
             res.code == matching::ErrorCode::MarketRemainderCancelled) ++ok;
         return true;
@@ -50,6 +55,7 @@ private:
     benchmark_runner::SplitMix64 rng_{42};
     std::uint64_t id_counter_ = 0;
     std::uint64_t qty_ = 0;
+    std::uint64_t last_filled_qty_ = 1;
 };
 
 }  // namespace
