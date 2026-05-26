@@ -1,8 +1,6 @@
 # llmes — Low-Latency Matching & Execution Simulator
 
-A C++20 simulator developed incrementally from correctness-first matching logic to later performance-focused redesigns.
-
-**Current implementation scope: Phase 1 / Matching Core only.**
+A C++20 order-matching engine evolved incrementally from a correctness-first baseline through data-structure optimization and HFT workload profiling.
 
 ---
 
@@ -10,312 +8,203 @@ A C++20 simulator developed incrementally from correctness-first matching logic 
 
 | Area | Status |
 |------|--------|
-| Matching Core (Phase 1) | Done |
-| Data structure | `std::map<price, std::list<Order>>` (price level + FIFO queue) |
-| Order types | Limit / Market / Cancel |
-| Trade output | `Trade` + `AddResult` |
-| Failure-mode handling | pending-cancel, market remainder cancel, duplicate ID |
-| Unit tests | rest / match / market sweep / pending cancel |
-| Benchmark harness | 7 scenarios x latency+PMC, version comparison plots |
-| Performance rewrite (Phase 2+) | Planned |
+| Matching core | Done |
+| Data structure | `std::map<price, IntrusiveList>` + `absl::flat_hash_map<id, Order*>` (phase2e) |
+| Order types | Limit / Market / Cancel / Modify |
+| Benchmark suite | 8 legacy + 9 HFT scenarios |
+| Hash table engineering | phase2b (`std::unordered_map`) → 2c (open-addressing) → 2d (Robin Hood) → **2e (`absl::flat_hash_map`)** |
+| HFT macro benchmark | Zero-Intelligence model with realistic order flow |
 | Market Data / Execution / Risk | Not started |
-| tslib / lfutils | Not started |
 
 ---
 
-## What Is Implemented (Phase 1)
+## Hash Table Engineering Journey
 
-Baseline central limit order book:
+The cancel path is the dominant operation in any realistic order-book workload. The engine evolved through five phases of hash-table optimization:
 
-- **Ask book:** ascending price; `begin()` = best ask
-- **Bid book:** descending price; `begin()` = best bid
-- **FIFO:** `std::list` per price level
-- **API:** `add_limit_order`, `add_market_order`, `cancel_order`
-- **Results:** `Trade`, `AddResult`, `ErrorCode`
+| Phase | ID Index | Macro ops/s | vs 2b | Key Limitation |
+|---|---|---|---|---|
+| **2b** | `std::unordered_map` | 11.0M | baseline | Node-based: pointer chase, cache- unfriendly |
+| 2c | Custom open-addressing + tombstones | 7.8M | −29% | Tombstone buildup degrades lookup under cancel-heavy load |
+| 2d | Robin Hood + backward-shift deletion | 7.8M | −29% | Probe chains regress under HFT spatial concentration |
+| **2e** | `absl::flat_hash_map` (Swiss Table) | **11.9M** | **+8%** | — |
 
-### Entry points
+**Winner: phase2e** — the Swiss-table `absl::flat_hash_map` outperforms hand-rolled open-addressing by 52% and the baseline `std::unordered_map` by 8% under realistic HFT order flow. See `report/phase2b_to_phase_2e_comparison.md` for full analysis.
 
-- `core/matching_core/include/matching/order_book.hpp`
-- `core/matching_core/src/order_book.cpp`
-- `core/matching_core/tests/order_book_test.cpp`
+---
+
+## HFT Benchmark Suite (Phase 3)
+
+Eight micro benchmarks isolate individual data-structure paths under HFT-realistic access patterns. The macro benchmark (Zero-Intelligence model) measures sustained throughput under a continuous mixed stream:
+
+| Scenario | What it stresses | HFT share |
+|---|---|---|
+| `hft_add_near` | Insert at best ±1 tick (hot path) | ~40% |
+| `hft_add_far` | Cold-path insert at deep levels | ~3% |
+| `hft_cancel_hot` | Erase from dense near-best level | ~45% |
+| `hft_cancel_cold` | Erase from sparse deep level | ~3% |
+| `hft_modify_near` | Erase + insert at hot price | ~5% |
+| `hft_cxl_miss` | Cancel-miss (worst-case lookup) | edge case |
+| `hft_market_small` | Bulk erase, 1-2 levels | ~1.7% |
+| `hft_market_large` | Bulk erase, 5+ levels | ~0.3% |
+| `hft_macro` | ZI model (all of the above, mixed) | definitive metric |
+
+### Key Design Features
+
+- **Realistic depth profile**: `PrefillHftBook` distributes orders with exponential decay from the best price (20% at tick 0, 18% at tick 1, ...)
+- **Spatial locality**: 90% of operations within ±5 ticks of the best price
+- **Cancel clusters**: Power-law burst sizes with temporal autocorrelation
+- **Normalized latency**: Market-order latency is divided by actual match count (`filled_quantity`) via `op_normalizer()` for fair comparison
+
+Full design rationale: `report/phase3_hft_benchmark_design.md`
 
 ---
 
 ## Build & Test
 
-**Requirements:** CMake >= 3.20, C++20 (GCC 13+ or Clang 16+ recommended)
+**Requirements:** CMake >= 3.20, C++20 (GCC 13+ or Clang 16+ recommended), Linux (for PMC benchmarks)
 
 ```bash
-cmake -S . -B build
-cmake --build build
+cmake -S . -B build -DLLMES_BUILD_BENCHMARKS=ON
+cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
 ```
 
-If you see `No test configuration file found`, run `ctest` with `--test-dir build` (or `cd build` then `ctest`).
-
----
-
-## Benchmark
-
-The benchmark suite measures per-operation latency and hardware performance counters
-for specific order-book operations. Each scenario is a standalone executable that
-implements the `IBenchScenario` interface via the **Strategy** pattern — the shared
-measurement harness (`benchmark_runner.cpp`) has no knowledge of individual scenario logic.
-
-### Architecture
-
-```
-┌──────────────────────────────────────────────────┐
-│                benchmark_runner.cpp               │
-│  ParseArgs() → warmup loop → measure loop → out  │
-│  (zero knowledge of which scenario it runs)       │
-└──────┬───────────────────────────────────────────┘
-       │ virtual dispatch via IBenchScenario
-       ▼
-┌──────────────────┐ ┌──────────────┐ ┌───────────┐
-│ bench_lmt_rest   │ │ bench_cxl_…  │ │ bench_…   │
-│ IBenchScenario   │ │ …            │ │ …         │
-└──────────────────┘ └──────────────┘ └───────────┘
-       │                        │
-       └──────────┬─────────────┘
-                  ▼
-┌──────────────────────────────────────────────────┐
-│              bench_common.hpp (header-only)        │
-│  PerfGroup • EnsureCsvHeader • Percentile          │
-│  PrefillSellBook                                   │
-└──────────────────────────────────────────────────┘
-```
-
-### Measurement modes
-
-- **Latency** (`--metric latency`): records `avg / p50 / p95 / p99` nanoseconds per
-  operation and `ops/s` throughput. Each iteration runs `batch_size` operations and
-  divides the wall-clock duration by `batch_size` to amortise timer overhead.
-- **PMC** (`--metric pmc`): reads hardware counters in-process via `perf_event_open`,
-  enabled only during the measured batch (user-space only, `exclude_kernel=1`).
-  Counters: `cycles`, `instructions`, `branches`, `branch-misses`, `cache-misses`.
-  Derived metrics: `cpi`, `branch_miss_rate`.
-
-### Scenario workloads
-
-| Scenario | Prefill | Measured operation | What it stresses |
-|---|---|---|---|
-| `lmt_rest` | Empty book | Insert non-crossing buy limit | Resting limit insert path |
-| `lmt_cross_shallow` | Sell book, spread across `levels` | Buy limit crossing only first 3 levels | Partial-match + remainder-insert path |
-| `lmt_cross_deep` | Sell book, spread across `levels` | Aggressive buy limit crossing all levels | Price-time priority queue matching cost |
-| `mkt_sweep_deep` | Sell book, spread across `levels` | Buy market order sweeping all levels | Sequential matching + queue removal |
-| `cxl_hit` | Sell book, spread across `levels` | Cancel an order known to exist | Successful cancel hot path |
-| `cxl_miss` | Sell book, spread across `levels` | Cancel non-existent order ID | Worst-case cancel lookup (hash miss) |
-| `dup_reject` | Sell book + one resting buy (ID=7) | Insert duplicate order ID=7 | Duplicate-detection lookup path |
-
-`orders` controls total prefill size and `levels` controls price-level dispersion.
-
-### Run pipeline
+### Benchmark Pipeline
 
 ```bash
-# 1. Build + run the full benchmark matrix (latency + PMC, all scenarios/trials)
+# 1. Full benchmark matrix (latency + PMC, all scenarios × trials)
 bash benchmark/scripts/run_benchmarks.sh
 
-# 2. Merge raw latency & PMC trials, compute mean/std/CV/95% CI per config
+# 2. Merge trials, compute mean/std/CV/95% CI per config
 python3 benchmark/scripts/merge_benchmark_metrics.py
 
-# 3. Baseline plots (metric vs. orders, one line per scenario)
+# 3. Parametric plots (metric vs. orders per scenario)
 python3 benchmark/scripts/plot_benchmark.py
 
-# 4. Version-comparison plots (metric vs. orders, one line per version_tag;
-#    bar charts at fixed config; %-change heatmaps)
+# 4. Version-comparison plots + bar charts + %-change heatmaps
 python3 benchmark/scripts/plot_version_comparison.py
 ```
 
-Override defaults if needed:
+Override parameters via environment variables:
 
 ```bash
-SCENARIOS=lmt_rest,cxl_miss METRICS=latency,pmc BATCH_SIZES=32,64 \
-VERSION_TAG=phase2_step1 COMMIT_SHA=<sha> TRIALS=5 ITERS=1200 WARMUP_ITERS=200 \
+SCENARIOS=hft_add_near,hft_cancel_hot METRICS=latency,pmc \
+VERSION_TAG=v2e COMMIT_SHA=<sha> TRIALS=5 \
   bash benchmark/scripts/run_benchmarks.sh
 ```
 
-### Version-comparison plotting
+---
 
-When iterating on optimizations, assign each build a unique `VERSION_TAG` (e.g.
-`v1.0`, `v2.0`, `v2.5`). After collecting multiple versions, run:
+## Architecture
 
-```bash
-PLOT_METRICS=p99_ns,cpi,cache_misses_per_op \
-PLOT_LEVEL=100 \
-FIXED_ORDERS=10000 \
-  python3 benchmark/scripts/plot_version_comparison.py
+The benchmark suite uses the **Strategy** pattern: each scenario implements `IBenchScenario`, and the shared `benchmark_runner` handles measurement, CSV output, and command-line parsing.
+
+```
+                   benchmark_runner.cpp
+                   (ParseArgs → warmup → measure → output)
+                           │
+                    IBenchScenario (virtual)
+               ┌───────────┼───────────────┐
+          bench_lmt_rest  bench_cxl_…  bench_hft_…
+               │                          │
+               └──────────┬───────────────┘
+                          ▼
+                   bench_common.hpp
+              PrefillSellBook / PrefillHftBook
 ```
 
-This generates three plot types:
+### Measurement Modes
 
-1. **Line charts** — per (scenario x metric), one line per `version_tag` with CI error bands.
-2. **Bar charts** — side-by-side bars at a fixed config (`FIXED_ORDERS`, `PLOT_LEVEL`),
-   annotated with absolute values.
-3. **Heatmaps** — percent change of each version relative to the first `version_tag`,
-   color-coded (green = improvement, red = regression).
-
-<!-- ### Remote execution
-
-Run the full pipeline (clone, build, benchmark, merge, plot, download) on a remote
-Linux server in one command:
-
-```bash
-SERVER_IP=1.2.3.4 \
-REPO_URL=git@github.com:you/llmes.git \
-  bash benchmark/scripts/run_remote_bench.sh
-```
-
-All benchmark campaign and plotting parameters can be overridden via env vars
-(see the top of `run_remote_bench.sh`). -->
-
-<!-- ### Infrastructure smoke test
-
-Validates the benchmark harness itself (CSV header management, percentile
-calculation, book prefill, end-to-end scenario dispatch):
-
-```bash
-cmake --build build --target benchmark_smoke_test
-./build/benchmark/benchmark_smoke_test
-``` -->
-
-### Output artifacts
-
-- Raw latency trials: `benchmark/results/{OUT_PREFIX}_latency_raw_trials.csv`
-- Raw PMC trials: `benchmark/results/{OUT_PREFIX}_pmc_raw_trials.csv`
-- Merged raw trials: `benchmark/results/{OUT_PREFIX}_merged_raw_trials.csv`
-- Aggregated stats (mean/std/cv/95% CI): `benchmark/results/{OUT_PREFIX}_merged_agg.csv`
-- Plots: `benchmark/results/plots/*.png`
-
-### Notes
-
-- PMC mode requires Linux perf support and permissions (`/proc/sys/kernel/perf_event_paranoid ≤ 1`).
-- On some virtualized cloud CPUs (Hetzner), `LLC-load-misses` / `LLC-store-misses`
-  are not exposed. The suite uses `cache-misses` instead; LLC metrics are deferred.
-- CSV headers are written idempotently by `EnsureCsvHeader()` — the bash script
-  only truncates the file before the campaign, and the C++ binary appends trial rows.
-- The `version_tag` and `commit_sha` fields in every CSV row enable precise
-  tracking of which build produced which numbers.
+- **Latency** (`--metric latency`): `avg / p50 / p95 / p99` nanoseconds per op and `ops/s`, normalized per batch.
+- **PMC** (`--metric pmc`): In-process hardware counters via `perf_event_open` (cycles, instructions, branches, misses, cache misses). Derived: CPI, branch miss rate.
 
 ---
 
-## Phase 1 Behavior
+## Key Results
 
-### Limit order
+### Phase 1 → Phase 2a (Pool Allocator)
 
-- Matches opposite side while price crosses.
-- Remainder rests on the same side at limit price.
-- FIFO within each price level.
+Pool-based `IntrusiveList` replaces `std::list`: 22–38% fewer instructions per op. Cancel-heavy scenarios see 2× throughput, memory latency drops dramatically (CPI −59%, cache misses −87%).
 
-### Market order
+### Phase 2a → Phase 2b (O(1) Cancel Index)
 
-- Consumes opposite liquidity until filled or book empty.
-- Unfilled remainder is not posted; returns `MarketRemainderCancelled`.
+`std::unordered_map<id, Order*>` eliminates O(N) book scan: cancel throughput improves **300–1800×**. Cross/match scenarios regress 40–80% due to hash-map maintenance overhead, but in a realistic mixed workload the net effect is **894× overall throughput**.
 
-### Cancel
+### Phase 2b → 2e (Hash Table Engineering)
 
-- Found on book -> removed, `Success`.
-- Not found -> `UnknownOrderId`, id added to pending-cancel set.
-- Later insert with same id -> `PendingCancelExists`.
+Under the HFT macro benchmark (48% cancel / 45% add), custom open-addressing (2c/2d) regresses 29% — tombstones and probe chains hurt cancel-heavy access. `absl::flat_hash_map` (2e) leads at 11.9M ops/s: 52% ahead of 2c/2d and 8% ahead of 2b.
 
-### Time Complexity
-
-#### Notation
-- `N`: total number of resting orders in the book (bid + ask).
-- `Pb` / `Pa`: number of price levels on bid / ask side.
-- `P`: number of price levels on the side touched by this operation (use `max(Pb, Pa)` for an upper bound).
-- `K`: number of maker orders actually visited/matched during this request.
-Assumption: `std::unordered_set` operations are average-case `O(1)` under normal hash distribution.
----
-
-#### Time Complexity (Phase 1 Implementation)
-| Function | Time Complexity (average) | Notes |
-|---|---:|---|
-| `OrderBook()` | `O(1)` | Empty container initialization |
-| `pending_cancel_count()` | `O(1)` | `unordered_set::size()` |
-| `cancel_order()` | `O(N)` | Linear scan across both books (`map` levels + `list` queues) |
-| `add_limit_order()` | `O(K + log P)` | Match `K` makers; if remainder exists, insert into `map` level (`log P`) |
-| `add_market_order()` | `O(K)` | Match only; no remainder posting |
-| `can_cross_limit()` | `O(1)` | Single price comparison |
----
-
-
-## Failure-Mode Coverage
-
-| Scenario | Behavior |
-|----------|----------|
-| Cancel before insert | Pending cancel; later insert rejected |
-| Duplicate order id | `DuplicateOrderId` |
-| Market sweeps book | Partial fill; remainder cancelled |
+Full reports:
+- `report/phase1_vs_phase2_report.md` — Phase 1 → 2a → 2b comparison
+- `report/phase2b_to_phase_2e_comparison.md` — Hash table engineering (2b–2e)
+- `report/phase3_hft_benchmark_design.md` — HFT benchmark design
 
 ---
 
 ## Project Layout
 
-```text
+```
 llmes/
 ├── CMakeLists.txt
 ├── readme.md
-├── readme_archive.md
-├── requirements.txt
-├── core/
-│   └── matching_core/
-│       ├── CMakeLists.txt
-│       ├── include/
-│       │   └── matching/
-│       │       └── order_book.hpp
-│       ├── src/
-│       │   └── order_book.cpp
-│       ├── tests/
-│       │   └── order_book_test.cpp
-│       └── compile_flags.txt
+├── core/matching_core/
+│   ├── include/matching/
+│   │   ├── order_book.hpp          # OrderBook class
+│   │   ├── intrusive_list.hpp      # Intrusive doubly-linked list
+│   │   ├── order_pool.hpp          # Pre-allocated order pool
+│   │   └── types.hpp               # Order, Trade, AddResult, ErrorCode
+│   ├── src/
+│   │   ├── order_book.cpp
+│   │   └── order_pool.cpp
+│   └── tests/
+│       └── order_book_test.cpp
 ├── benchmark/
 │   ├── CMakeLists.txt
 │   ├── src/
-│   │   ├── benchmark_runner.hpp
-│   │   ├── bench_common.hpp
-│   │   ├── bench_lmt_rest.cpp
-│   │   ├── bench_lmt_cross_deep.cpp
-│   │   ├── bench_lmt_cross_shallow.cpp
-│   │   ├── bench_mkt_sweep_deep.cpp
-│   │   ├── bench_cxl_hit.cpp
-│   │   ├── bench_cxl_miss.cpp
-│   │   └── bench_dup_reject.cpp
-│   ├── runner/
-│   │   └── benchmark_runner.cpp
-│   ├── tests/
-│   │   └── benchmark_smoke_test.cpp
+│   │   ├── benchmark_runner.hpp    # IBenchScenario interface
+│   │   ├── bench_common.hpp        # PrefillSellBook, PrefillHftBook, utilities
+│   │   ├── legacy/                 # 8 legacy micro benchmarks
+│   │   └── hft/                    # 9 HFT benchmarks (micro + macro)
+│   ├── runner/benchmark_runner.cpp
 │   ├── scripts/
 │   │   ├── run_benchmarks.sh
-│   │   ├── run_remote_bench.sh
 │   │   ├── merge_benchmark_metrics.py
 │   │   ├── plot_benchmark.py
 │   │   └── plot_version_comparison.py
-│   └── results/             # generated by benchmark scripts
-└── build/                  # generated by CMake
+│   └── results/                    # generated CSV + plots
+├── report/                         # design docs + analysis reports
+└── server_results/                 # remote benchmark run artifacts
 ```
 
 ---
 
 ## Design Notes
 
-- Intentional minimal Phase 1 baseline (correctness first).
-- Cancel scans price levels (expected for this phase).
-- Later: intrusive list, id index, skip list, SoA, pmr, benchmarks.
+- **Correctness first**: Phase 1 used `std::map` + `std::list` for a straightforward, verifiable implementation.
+- **Phase 2a**: Pool allocator eliminates `malloc`/`free` from the hot path — instruction count drops 22–38%.
+- **Phase 2b**: O(1) cancel index transforms the engine for cancel-dominated workloads. The trade-off (hash-map overhead on every match) is acceptable given 97% cancellation in real markets.
+- **Phase 2e**: `absl::flat_hash_map`'s Swiss-table design handles HFT spatial locality better than both `std::unordered_map` and hand-rolled open-addressing.
+- **Phase 3**: HFT benchmarks replace the original ad-hoc workload mix with empirically grounded order flow: exponential depth decay, spatial concentration at the best price, cancel clusters, and a Zero-Intelligence macro model.
+
+---
+
+## Time Complexity
+
+| Function | Average | Notes |
+|---|---|---|
+| `cancel_order()` | O(1) | Hash index via `id_to_order_` + intrusive-list erase |
+| `add_limit_order()` | O(K + log P) | Match K makers; insert into `std::map` level (log P) |
+| `add_market_order()` | O(K) | Match only; no remainder |
+
+N = total resting orders, P = price levels, K = makers matched.
 
 ---
 
 ## Roadmap
 
-1. Phase 1 (current): functional core + tests + benchmark harness
-2. Phase 2: intrusive queue, O(1) cancel index, skip list
-3. Phase 3: SoA, cache alignment, pmr experiments
-4. Phase 4: advanced profiling (LLC load/store, front-end stalls, roofline)
+1. **Phase 1** ✓ — Functional core + tests + benchmark harness
+2. **Phase 2** ✓ — Intrusive queue + O(1) cancel index + hash table engineering
+3. **Phase 3** ✓ — HFT micro + macro benchmarks, realistic workload modeling
+4. Phase 4 — SoA, cache alignment, pmr, advanced profiling (LLC, front-end stalls, roofline)
 5. Market data, execution, risk, tslib, lfutils
-
----
-
-
-## Disclaimer
-
-README distinguishes implemented vs planned features as the project grows.
