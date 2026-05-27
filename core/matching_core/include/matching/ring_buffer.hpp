@@ -1,11 +1,10 @@
 #pragma once
 
-#include "matching/order_book.hpp"
+#include "intrusive_list.hpp"
 #include "types.hpp"
 #include "absl/container/flat_hash_map.h"
 
 #include <limits>
-#include <memory>
 
 
 namespace matching {
@@ -20,12 +19,12 @@ private:
 
     struct Slot {
         std::int64_t price = Invalid;
-        PriceLevel level;  // pointer to intrusive list with price
+        IntrusiveList level;  // pointer to intrusive list with price
     };
 
     std::array<Slot, RingSize> ring_buffer_;    // light-weight order book on hot path
 
-    absl::flat_hash_map<std::int64_t, PriceLevel> cold_map_;  // heavy-weight order book on cold path
+    absl::flat_hash_map<std::int64_t, IntrusiveList> cold_map_;  // heavy-weight order book on cold path
 
     std::int64_t best_price_ = Invalid;
     std::size_t best_price_idx_ = 15;
@@ -41,7 +40,7 @@ private:
     }
 
 public:
-    PriceLevel* find(std::int64_t price);
+    IntrusiveList* find(std::int64_t price);
 
     void insert(std::int64_t price, Order* order);
 
@@ -50,36 +49,38 @@ public:
     std::int64_t best_price() { return best_price_; }
     bool empty() const { return best_price_ == Invalid; }
 
-    PriceLevel* best_price_level() {
+    IntrusiveList* best_price_level() {
         return (best_price_ == Invalid) ? nullptr : &ring_buffer_[best_price_idx_].level;
     }
 };
 
 template <bool IsAsk>
-PriceLevel* RingBuffer<IsAsk>::find(std::int64_t price) {
+IntrusiveList* RingBuffer<IsAsk>::find(std::int64_t price) {
     // the book has not been initialized yet
     if (best_price_ == Invalid)     return nullptr;
 
     std::size_t idx = calc_idx(price);
     auto& slot = ring_buffer_[idx];
 
-    // hot ring hit
+    // hot ring hit and correct price
     if (slot.price == price)
         return &(slot.level);
     
-    // hot ring hit but outdated data, move it to cold map
-    if (!slot.price.empty()) {
-        cold_map_[slot.price] = slot.level;
-        slot.price = Invalid;
-        // How to set slot.level to invalid?
+    // hot ring hit but outdated price, move it to cold map
+    if (!slot.level.empty()) {
+        cold_map_[slot.price] = std::move(slot.level);
     }
 
-    // reaching here means current slot is empty (slot.price == Invalid)
+    // Set this slot to be invalid
+    slot.price = Invalid;
+
+    // reaching here means current slot is empty (slot.level.empty())
     auto it = cold_map_.find(price);
-    if (it == cold_map_.end())  return nullptr;     // current price does not exist
+    if (it == cold_map_.end())  
+        return nullptr;     // current price does not exist
     
-    // move pricelevel from cold map to hot array
-    slot.level = it->second;
+    // move IntrusiveList from cold map to hot array
+    slot.level = std::move(it->second);
     cold_map_.erase(it);
     slot.price = price;
 
