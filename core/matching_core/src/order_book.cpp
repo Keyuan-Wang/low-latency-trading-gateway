@@ -102,14 +102,12 @@ AddResult OrderBook::add_limit_order(std::uint64_t order_id, Side side, std::int
     // Consume opposite-side liquidity while the limit price permits crossing.
     auto match_against = [&](auto& opposite_book) {
         while (remaining > 0 && !opposite_book.empty()) {
-            const std::int64_t best_price = opposite_book.begin()->first;
+            const std::int64_t best_price = opposite_book.best_price();
             if (!can_cross_limit(side, price, best_price)) {
                 break;
             }
 
-            auto level_it = opposite_book.begin();
-
-            auto& price_level = level_it->second;   // an intrusive list
+            auto& price_level = opposite_book.best_level();
 
             while (remaining > 0 && !price_level.empty()) {
                 Order& maker = price_level.front();
@@ -132,7 +130,7 @@ AddResult OrderBook::add_limit_order(std::uint64_t order_id, Side side, std::int
             }
             
             if (price_level.empty())
-                opposite_book.erase(level_it);
+                opposite_book.erase_best();
         }
     };
 
@@ -156,11 +154,11 @@ AddResult OrderBook::add_limit_order(std::uint64_t order_id, Side side, std::int
 
     *node = {order_id, price, remaining, timestamp};
     if (side == Side::Buy) {
-        auto& level = bids_[price];
+        auto& level = bids_.get_or_create(price);
         level.push_back(*node);
         node->parent_level = &level;
     } else {
-        auto& level = asks_[price];
+        auto& level = asks_.get_or_create(price);
         level.push_back(*node);
         node->parent_level = &level;
     }
@@ -202,8 +200,7 @@ AddResult OrderBook::add_market_order(std::uint64_t order_id, Side side, std::ui
 
     auto match_against = [&](auto& opposite_book) {
         while (remaining > 0 && !opposite_book.empty()) {
-            auto level_it = opposite_book.begin();
-            auto& price_level = level_it->second;   // an intrusive list
+            auto& price_level = opposite_book.best_level();
 
             while (remaining > 0 && !price_level.empty()) {
                 Order& maker = price_level.front();
@@ -226,7 +223,7 @@ AddResult OrderBook::add_market_order(std::uint64_t order_id, Side side, std::ui
             }
 
             if (price_level.empty())
-                opposite_book.erase(level_it);
+                opposite_book.erase_best();
         }
     };
 

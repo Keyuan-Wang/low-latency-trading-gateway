@@ -21,15 +21,58 @@ namespace matching {
 
 using PriceLevel = IntrusiveList;
 
-/**
- * @brief Ask side: ascending price map; @c begin() is best (lowest) ask.
- */
-using AskBook = std::map<std::int64_t, PriceLevel, std::less<>>;
+template <bool IsAsk>
+struct PriceCompare;
+
+template <>
+struct PriceCompare<true> {
+    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
+        return lhs < rhs;
+    }
+};
+
+template <>
+struct PriceCompare<false> {
+    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
+        return lhs > rhs;
+    }
+};
 
 /**
- * @brief Bid side: descending price map; @c begin() is best (highest) bid.
+ * @brief Price-level container for one side of the book.
+ *
+ * @details Phase 4 V1 deliberately keeps the storage as an ordered map.  The
+ * wrapper isolates the operations OrderBook needs so later phases can replace
+ * the backing container without rewriting matching logic.
  */
-using BidBook = std::map<std::int64_t, PriceLevel, std::greater<>>;
+template <bool IsAsk>
+class SideBook {
+private:
+    std::map<std::int64_t, PriceLevel, PriceCompare<IsAsk>> levels_{};
+public:
+    [[nodiscard]] bool empty() const noexcept {
+        return levels_.empty();
+    }
+
+    [[nodiscard]] std::int64_t best_price() const {
+        return levels_.begin()->first;
+    }
+
+    [[nodiscard]] PriceLevel& best_level() {
+        return levels_.begin()->second;
+    }
+
+    PriceLevel& get_or_create(std::int64_t price) {
+        return levels_[price];
+    }
+
+    void erase_best() {
+        levels_.erase(levels_.begin());
+    }
+};
+
+using AskBook = SideBook<true>;
+using BidBook = SideBook<false>;
 
 /**
  * @brief Phase-1 central limit order book (two-sided, price–time priority at each level).
