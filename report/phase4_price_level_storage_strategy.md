@@ -422,30 +422,303 @@ Avoid these changes in the first implementation pass:
 - Do not judge a design only on micro benchmarks; `hft_macro` is the final
   workload.
 - Do not keep `parent_level*` if price levels can move between containers.
+- Do not assume a storage-locality change will improve macro throughput without
+  first profiling the actual operation mix. The ChunkPool experiment (see below)
+  is the canonical example: a plausible hypothesis, a benchmark campaign, a bug
+  that invalidated the early result, and a corrected measurement that showed the
+  simpler design was faster.
+
+---
+
+## Experiment: ChunkPool (April–June 2026)
+
+### Hypothesis
+
+The ChunkPool design was motivated by a cache locality hypothesis:
+
+- A single large order pool scatters orders from the same hot price level across
+  separate memory pages.
+- Grouping orders into smaller per-level chunks should keep same-price-level
+  orders contiguous in cache, reducing cache misses on cancellation and market
+  sweeps.
+- Different `kChunkSize` values might expose a better locality/overhead
+  trade-off.
+
+### Architecture
+
+The ChunkPool design (branch `phase4a`, later `phase4-finale`) replaces the
+single `OrderPool` with:
+
+```
+OrderPool (master)                  ChunkPool (phase4-finale)
+┌─────────────────────┐            ┌──────┐ ┌──────┐ ┌──────┐
+│ orders_[0..N]       │            │Chunk1│ │Chunk2│ │Chunk3│ ...
+│ (single allocation) │            │256   │ │256   │ │256   │
+│                     │            │orders│ │orders│ │orders│
+│ PriceLevel per      │            └──┬───┘ └──┬───┘ └──┬───┘
+│   price → fifo list │              │        │        │
+└─────────────────────┘              ▼        ▼        ▼
+                              PriceLevel A  PriceLevel A
+                                (hot!)      (hot, more orders)
+```
+
+Key structural changes:
+
+- `ChunkPool`: owns a fixed array of `Chunk[]`. Each chunk holds `kChunkSize`
+  contiguous `Slot{Order + next_free}` elements. Provides `acquire_empty_chunk()`
+  and `release_empty_chunk()`.
+- `Chunk`: per-chunk free-slot stack (`allocate_order()` / `release_order()`).
+  Maintains `link_available()` / `unlink_available()` for per-PriceLevel
+  available-chunk list.
+- `PriceLevel`: instead of a single fist pointer, manages a local linked list of
+  chunks (`available_head_`). `allocate()` pops from the head chunk; `remove()`
+  counts freed slots and returns empty chunks to `ChunkPool`.
+- `chunk_from_order()`: O(1) owner-chunk lookup via byte-offset arithmetic on
+  `Order*`, used in both `PriceLevel::remove()` and `ChunkPool::release_empty_chunk()`.
+
+The `ChunkPool` constructor with `max_active_levels` accounts for fragmentation:
+each active price level gets one chunk before the remaining capacity is divided
+into full-chunk units.
+
+```cpp
+// chunk_count_for (two-arg overload)
+return active_levels + (order_capacity - active_levels) / kChunkSize;
+```
+
+A `PriceLevel` only owns chunks while they contain live orders. Full chunks are
+unlinked from `available_head_` (but retained by the level). Empty chunks are
+returned to `ChunkPool`'s global free list. This means a hot price level with
+many orders keeps many chunks allocated, while cold levels with few orders hold
+only a single partially-filled chunk.
+
+### Initial Benchmark Campaign (Bug-Affected)
+
+A 10-trial, 8-micro + 1-macro campaign was run comparing `master` (with
+ChunkPool at kChunkSize=16/32/64/128/256) against `phase4a` (the `IntrusiveList`
+wrapped behind `SideBook`, no ChunkPool).
+
+Artifacts: `benchmark/results/campaign_20260601_1319/`
+
+The initial per-scenario summary showed phase4a as the apparent winner:
+
+| Scenario | Best chunk result | phase4a |
+|---|---:|---:|
+| `hft_add_near` | 21,438,083 | 23,863,634 |
+| `hft_cancel_hot` | 10,706,453 | 13,167,589 |
+| `hft_macro` | 16,075,480 | 15,958,480 |
+
+### Bug Discovery: Cancel-Miss Accounting Drift
+
+Per-operation profiling (`LLMES_PROFILE_HFT_MACRO_OPS`) exposed the problem. The
+`hft_macro` benchmark's Setup() was generating `PendingOp` batches from a
+**predictive tracking map** that could drift from actual book state:
+
+```text
+Observed operation share (bug-affected, 1 trial):
+  add_rest:     48.30%
+  cancel_miss:  43.69%   ← should be near 0%
+  cancel_hit:    1.32%   ← should be ~46%
+  modify_hit:    0.09%
+  market:        1.85%
+```
+
+The root cause: market-order maker fills, crossing limit-order fills, and
+modify outcomes were not reflected in the tracking map during batch
+pre-generation. The map thought orders existed that had already been consumed.
+This produced a massive false `cancel_miss` rate that distorted the benchmark's
+operation mix away from the intended 45/48/5/2 distribution, making the
+measured workload unrepresentative of real HFT flow.
+
+### Fix: Planning-Book Replay Model
+
+The fix (commit `7039990`, from branch `phase4-finale`) replaced the predictive
+batch generation with a **dual-book planning-replay model**:
+
+```text
+Setup():
+  1. Warmup: populate book_ and tracking map together
+  2. build_book_from_tracking() → book_ and planning_book_ (identical copies)
+  3. For each PendingOp:
+     a. Execute on planning_book_ first (untimed)
+     b. Update tracking from real AddResult / Trade outputs
+     c. Validate cancel/modify targets against live book state
+  4. planning_book_ destructed (no longer needed)
+  
+RunOp():
+  Execute the same PendingOp on book_ (timed, no RNG, no map lookups)
+```
+
+The planning book captures all side effects (market sweeps, crossing fills,
+modify rest/cross outcomes, cluster-cancel success/failure) so the tracking
+map stays in sync with what `book_` will see during timed execution.
+
+### Corrected Benchmark Result
+
+A focused campaign comparing the repaired `master` (OrderPool) against
+`phase4-finale` (ChunkPool, kChunkSize=16/32/64/128/256), hft_macro only,
+1 trial each:
+
+**Artifacts:** `benchmark/results/macro_master_vs_phase4_finale_chunkSweep_20260601/`
+
+| Version | Architecture | ops/s | avg_ns | vs master |
+|---|---|---|---|---|
+| **master** | OrderPool | **28.1M** | 35.6 | — |
+| phase4-finale chunk16 | ChunkPool | 24.3M | 41.2 | −13.6% |
+| phase4-finale chunk32 | ChunkPool | 24.6M | 40.7 | −12.5% |
+| phase4-finale chunk64 | ChunkPool | 24.4M | 40.9 | −13.0% |
+| phase4-finale chunk128 | ChunkPool | 24.7M | 40.5 | −12.1% |
+| phase4-finale chunk256 | ChunkPool | 24.7M | 40.5 | −12.0% |
+
+**Conclusions:**
+
+1. **OrderPool outperforms ChunkPool by 12–14%** on the repaired hft_macro
+   benchmark. The version we previously thought was regressing (master/OrderPool)
+   is actually the faster design.
+
+2. **kChunkSize is irrelevant for macro throughput.** The five chunk-size
+   variants cluster within 1.8% of each other (24.3M–24.7M ops/s), close to
+   measurement noise at 1 trial. The chunk management overhead dominates any
+   locality benefit.
+
+3. **The cache-locality hypothesis is falsified for this workload.** The repaired
+   profiling shows that `add_rest` (52.98% of weighted macro time) and
+   `cancel_hit` (35.44%) dominate the measured cost. Neither operation benefits
+   from per-level order clustering:
+   - `add_rest` pays chunk allocation/linking on every insertion.
+   - `cancel_hit` already has O(1) hash-table lookup + intrusive unlink; chunk
+     slot recovery (`chunk_from_order`, `link_available`) adds extra operations.
+
+4. **The earlier campaign (campaign_20260601_1319) was invalidated by the
+   cancel-miss bug.** The ~43% false miss rate in the batch stream made the
+   measured workload unrepresentative of the intended HFT mix. The corrected
+   benchmark is the authoritative reference.
+
+### Why ChunkPool Regresses
+
+Per-operation profiling of the repaired `phase4-finale` macro workload shows the
+dominant cost center is `add_rest`, contributing 52.98% of total measured time.
+The `add_rest` path in ChunkPool executes:
+
+1. `SideBook::get_or_create(price)` — `std::map` node lookup/creation
+2. `PriceLevel::allocate()` — chunk list walk + possibly `acquire_empty_chunk()`
+3. Aggregate assignment to Order fields
+4. `PriceLevel::push_back()` — intrusive list append
+5. `id_to_order_.emplace()` — Swiss-table insert
+
+In the OrderPool design, step 2 is a simple pop from a single pre-allocated
+array with no chunk linkage overhead. Steps 1, 3, 4, 5 are identical.
+
+The `cancel_hit` path (35.44% weighted time) in ChunkPool executes:
+
+1. `id_to_order_.find()` — Swiss-table lookup
+2. `PriceLevel::remove()` — intrusive unlink
+3. `ChunkPool::chunk_from_order()` — byte-offset arithmetic
+4. `Chunk::release_order()` — free-slot stack push
+5. Conditionally: `link_available()` (if chunk was full) or `unlink_available()`
+   + `release_empty_chunk()` (if chunk is now empty)
+
+In OrderPool, steps 3–5 are replaced by a direct pool return. The extra pointer
+operations and conditional branches add measurable overhead on the
+second-most-frequent operation.
+
+The structural cost is that ChunkPool trades **simpler allocation for better
+locality that the workload does not need.** The macro benchmark's operation mix
+(high add, high cancel, low market sweep) means order lifetimes are short and
+same-level traversal is rare — the scenario where chunk locality would pay off
+simply does not occur.
+
+---
+
+## Current Baseline: OrderPool (master)
+
+Based on the corrected benchmark results, the current `master` branch is the
+correct Phase 4 starting point:
+
+| Component | Implementation |
+|---|---|
+| Order storage | `OrderPool` — single contiguous allocation, O(1) acquire/release |
+| Per-level queue | Intrusive doubly-linked list (no separate node allocation) |
+| Cancel/modify index | `absl::flat_hash_map<uint64_t, Order*>` |
+| Price-level storage | `std::map<int64_t, IntrusiveList>` (wrapped in `SideBook`) |
+| `hft_macro` ops/s | **28.1M** (1 trial, orders=100000, levels=100) |
+
+The main structural simplification in this version is that `OrderPool` uses a
+single pre-allocated array with a free-list stack. Each `PriceLevel` gets a
+simple intrusive FIFO queue. The pool does not need per-level chunk tracking,
+`chunk_from_order()` byte-offset reverse-lookups, or empty-chunk return logic.
+
+This is the reference for all future Phase 4 changes.
+
+### What the Data Tells Us About Optimization Priority
+
+The repaired per-operation profiling (`report/phase4_hft_macro_optimization_priority.md`)
+establishes the optimization leverage for each operation type:
+
+| Operation | Weighted time share | Mean latency | Optimization priority |
+|---|---|---|---|
+| `add_rest` | 52.98% | 69.85 ns | **Highest** — high frequency, quote-placement path |
+| `cancel_hit` | 35.44% | 48.46 ns | Medium — already fast and tight-tailed (p99=70ns) |
+| `modify_hit` | 8.16% | 131.36 ns | Medium-low — expensive but low frequency (3.9%) |
+| `market` | 2.86% | 113.42 ns | Low — rare (1.6%), shallow sweeps (p99 levels=1) |
+
+The `add_rest` dominance means Phase 4 should prioritize the insertion path
+over cache-locality work for cancellation or market sweeps. The fixed costs in
+`add_rest` include:
+
+1. `pending_cancel_ids_.contains()` — hash-set lookup
+2. `id_to_order_.contains()` — Swiss-table lookup (duplicate check)
+3. crossing check against opposite-side best level
+4. `SideBook::get_or_create(price)` — `std::map` tree lookup/insertion
+5. `PriceLevel::allocate()` — pool free-list pop
+6. `PriceLevel::push_back()` — intrusive list append
+7. `id_to_order_.emplace()` — Swiss-table insert
+
+Neither the profiling data nor the ChunkPool experiment point toward
+same-level order locality as the binding constraint. The next optimization
+candidates are in the **price-level lookup** (step 4) and the **duplicate/pending
+check sequence** (steps 1–2), not in order storage layout.
 
 ---
 
 ## Recommended Next Step
 
-Start Phase 4 with:
+With the ChunkPool experiment recorded and the OrderPool baseline established,
+the next Phase 4 work should:
+
+1. **Run the price-locality telemetry described in V3.** The profiling shows
+   `add_rest` dominates weighted time, and `add_rest` always involves a
+   `get_or_create(price)` call. Quantify how often that call hits an existing
+   level (cheap) versus creates a new `std::map` node (expensive).
+
+2. **Profile the `add_rest` sub-path costs.** Distinguish between:
+   - duplicate + pending-cancel checks (hash-table lookups)
+   - crossing check (reads best opposite level, usually no match)
+   - price-level lookup or creation (the `std::map` cost)
+   - order allocation and queue append
+   - `id_to_order_` insertion
+
+3. **Consider moving the hash-table checks after the crossing check.** If
+   duplicate and pending-cancel checks are cheap per-operation but run on every
+   `add_rest`, reordering to a single combined check path may save redundant
+   work.
+
+4. **Defer hot-ring work until telemetry confirms near-best price concentration
+   is high enough to justify the complexity.** The ChunkPool experiment is a
+   cautionary example: a cache-locality intuition that did not survive
+   benchmark contact. The same discipline should apply to the hot ring.
+
+5. **Do not revisit ChunkPool.** The corrected macro benchmark shows it is
+   structurally slower than the simpler OrderPool design, and no kChunkSize
+   value changes this conclusion. The experiment is recorded for reference but
+   the design is not the active baseline.
+
+The following versions from the original plan remain relevant:
 
 ```text
-V0: restore map baseline
-V1: introduce SideBook backed by std::map
+V2: Replace std::map with absl::btree_map (low-risk ordered container swap)
+V3: Add price-locality telemetry (prerequisite for hot-structure sizing)
+V4: Hot ring + ordered cold map (only after V3 data justifies it)
 ```
 
-These two versions create a stable foundation for later container experiments.
-Only after V1 is benchmark-neutral should the project move to `absl::btree_map`
-or hot-ring work.
-
-The expected final architecture, if benchmarks justify it, is:
-
-```text
-Hot ring/vector for near-best price levels
-Ordered cold map for arbitrary out-of-window prices
-Bitmap for hot best discovery
-Optional cold hash index only if cold-path telemetry justifies it
-```
-
-This keeps the project disciplined: correctness first, measurable changes
-second, complexity only when the data pays for it.
+V0 and V1 are already implemented — the current master is the `std::map` + `SideBook`
+baseline.
