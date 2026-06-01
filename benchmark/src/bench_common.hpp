@@ -34,6 +34,23 @@
 
 namespace benchmark_runner {
 
+struct PerfEventSpec {
+	std::string name;
+	std::uint64_t type = 0;
+	std::uint64_t config = 0;
+};
+
+inline std::uint64_t PerfCacheConfig(std::uint64_t cache,
+																		 std::uint64_t op,
+																		 std::uint64_t result) noexcept {
+	return cache | (op << 8) | (result << 16);
+}
+
+inline std::uint64_t PerfAmdRawConfig(std::uint64_t event,
+																			std::uint64_t umask) noexcept {
+	return event | (umask << 8);
+}
+
 /**
 	* @brief Minimal splitmix64 PRNG — ~2 ns/call, deterministic, seedable.
 	*
@@ -92,22 +109,33 @@ class PerfGroup {
 	 * @return true if every counter was opened successfully.
 	 */
 	bool Open() {
+		return Open({
+				{"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+				{"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+				{"branches", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS},
+				{"branch_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES},
+				{"cache_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+		});
+	}
+
+	/**
+	 * @brief Open a caller-specified counter group.
+	 *
+	 * The first event becomes the group leader. All following events join the
+	 * same group so ResetEnable(), Disable(), and ReadValues() operate on a
+	 * single synchronized measurement window.
+	 */
+	bool Open(const std::vector<PerfEventSpec>& specs) {
 		CloseAll();
-		if (!OpenCounter(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES, -1)) {
-			return false;
-		}
-		if (!OpenCounter(PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, leader_fd_)) {
-			return false;
-		}
-		if (!OpenCounter(
-						PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, leader_fd_)) {
-			return false;
-		}
-		if (!OpenCounter(PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES, leader_fd_)) {
-			return false;
-		}
-		if (!OpenCounter(PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES, leader_fd_)) {
-			return false;
+		event_names_.clear();
+		if (specs.empty()) return false;
+
+		for (const auto& spec : specs) {
+			const int group_fd = (leader_fd_ < 0) ? -1 : leader_fd_;
+			if (!OpenCounter(spec.type, spec.config, group_fd)) {
+				return false;
+			}
+			event_names_.push_back(spec.name);
 		}
 		return true;
 	}
@@ -144,6 +172,7 @@ class PerfGroup {
 	 */
 	bool ReadValues(std::array<std::uint64_t, 5>& out) const {
 		if (leader_fd_ < 0) return false;
+		if (fds_.size() != out.size()) return false;
 		struct ReadData {
 			std::uint64_t nr;
 			std::uint64_t values[5];
@@ -154,6 +183,25 @@ class PerfGroup {
 		}
 		for (std::size_t i = 0; i < 5; ++i) out[i] = data.values[i];
 		return true;
+	}
+
+	bool ReadValues(std::vector<std::uint64_t>& out) const {
+		if (leader_fd_ < 0 || fds_.empty()) return false;
+
+		std::vector<std::uint64_t> data(1 + fds_.size(), 0);
+		const ssize_t expected =
+				static_cast<ssize_t>(data.size() * sizeof(std::uint64_t));
+		const ssize_t n = read(leader_fd_, data.data(), data.size() * sizeof(std::uint64_t));
+		if (n != expected || data[0] != fds_.size()) {
+			return false;
+		}
+
+		out.assign(data.begin() + 1, data.end());
+		return true;
+	}
+
+	[[nodiscard]] const std::vector<std::string>& EventNames() const noexcept {
+		return event_names_;
 	}
 
 	/** @brief Close all opened counter FDs. */
@@ -194,12 +242,96 @@ class PerfGroup {
 			if (fd >= 0) close(fd);
 		}
 		fds_.clear();
+		event_names_.clear();
 		leader_fd_ = -1;
 	}
 
 	int leader_fd_{-1};           ///< Group-leader FD, or -1 if not opened
 	std::vector<int> fds_{};      ///< All opened counter FDs (leader included)
+	std::vector<std::string> event_names_{};
 };
+
+inline std::vector<PerfEventSpec> HftMacroPerfGroupSpec(const std::string& group) {
+	if (group == "core") {
+		return {
+				{"cycles", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CPU_CYCLES},
+				{"instructions", PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS},
+				{"branches", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_INSTRUCTIONS},
+				{"branch_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_BRANCH_MISSES},
+		};
+	}
+	if (group == "cache") {
+		return {
+				{"cache_references", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_REFERENCES},
+				{"cache_misses", PERF_TYPE_HARDWARE, PERF_COUNT_HW_CACHE_MISSES},
+		};
+	}
+	if (group == "l1d") {
+		return {
+				{"l1d_loads", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_L1D,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_ACCESS)},
+				{"l1d_load_misses", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_L1D,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_MISS)},
+		};
+	}
+	if (group == "l2") {
+		return {
+				{"l2_dc_accesses_from_l1_misses", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x60, 0xe8)},
+				{"l2_dc_hits_from_l1_misses", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x64, 0xf0)},
+				{"l2_dc_misses_from_l1_misses", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x64, 0x08)},
+		};
+	}
+	if (group == "l2_all") {
+		return {
+				{"l2_all_no_prefetch", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x60, 0xf9)},
+				{"l2_hit_no_prefetch", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x64, 0xf6)},
+				{"l2_miss_no_prefetch", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x64, 0x09)},
+		};
+	}
+	if (group == "l2_fill") {
+		return {
+				{"l2_fill_busy_cycles", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x6d, 0x01)},
+				{"l2_cycles_waiting_on_fills_div4", PERF_TYPE_RAW,
+				 PerfAmdRawConfig(0x62, 0x01)},
+		};
+	}
+	if (group == "llc") {
+		return {
+				{"llc_loads", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_LL,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_ACCESS)},
+				{"llc_load_misses", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_LL,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_MISS)},
+		};
+	}
+	if (group == "dtlb") {
+		return {
+				{"dtlb_loads", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_DTLB,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_ACCESS)},
+				{"dtlb_load_misses", PERF_TYPE_HW_CACHE,
+				 PerfCacheConfig(PERF_COUNT_HW_CACHE_DTLB,
+												 PERF_COUNT_HW_CACHE_OP_READ,
+												 PERF_COUNT_HW_CACHE_RESULT_MISS)},
+		};
+	}
+	return {};
+}
 
 /**
 	* @brief Ensure a CSV file has a header row.

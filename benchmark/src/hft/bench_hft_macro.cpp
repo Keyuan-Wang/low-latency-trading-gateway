@@ -38,6 +38,10 @@
 #define LLMES_PROFILE_HFT_MACRO_OPS 0
 #endif
 
+#ifndef LLMES_PROFILE_HFT_MACRO_OP_PMCS
+#define LLMES_PROFILE_HFT_MACRO_OP_PMCS 0
+#endif
+
 #if LLMES_PROFILE_HFT_MACRO_OPS && (defined(__x86_64__) || defined(__i386__))
 #include <x86intrin.h>
 #endif
@@ -144,17 +148,41 @@ public:
     bool RunOp(const benchmark_runner::Args& args, std::uint64_t iter_idx,
                std::uint64_t batch_idx, std::uint64_t& ok) override {
 #if LLMES_PROFILE_HFT_MACRO_OPS
+        if (op_pmc_failed_) return false;
         if (iter_idx >= args.warmup_iters) {
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+            if (op_pmc_enabled_ && !op_perf_.ResetEnable()) {
+                std::cerr << "failed to enable hft_macro op PMC group\n";
+                return false;
+            }
+#endif
             const std::uint64_t c0 = ReadCycles();
             const auto t0 = Clock::now();
             const ExecuteOutcome outcome = execute_pending(batch_idx, ok);
             const auto t1 = Clock::now();
             const std::uint64_t c1 = ReadCycles();
 
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+            if (op_pmc_enabled_) {
+                if (!op_perf_.Disable()) {
+                    std::cerr << "failed to disable hft_macro op PMC group\n";
+                    return false;
+                }
+                if (!op_perf_.ReadValues(op_pmc_values_)) {
+                    std::cerr << "failed to read hft_macro op PMC group\n";
+                    return false;
+                }
+            }
+#endif
+
             const auto dt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 t1 - t0).count();
             const std::uint64_t cycles = (c1 >= c0) ? (c1 - c0) : 0ULL;
-            RecordProfileSample(outcome, static_cast<double>(dt_ns), cycles);
+            RecordProfileSample(outcome, static_cast<double>(dt_ns), cycles
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+                                , op_pmc_enabled_ ? &op_pmc_values_ : nullptr
+#endif
+            );
             return true;
         }
 #endif
@@ -212,6 +240,9 @@ private:
         std::uint64_t market_filled_sum = 0;
         std::vector<std::uint64_t> market_levels_samples;
         std::vector<std::uint64_t> market_filled_samples;
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+        std::vector<std::uint64_t> total_pmc;
+#endif
     };
 #endif
 
@@ -249,6 +280,16 @@ private:
     std::uint64_t measured_iters_done_ = 0;
     bool current_iter_is_measured_ = false;
     bool profile_emitted_ = false;
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+    benchmark_runner::PerfGroup op_perf_{};
+    std::string op_pmc_group_name_{};
+    std::vector<benchmark_runner::PerfEventSpec> op_pmc_specs_{};
+    std::vector<std::uint64_t> op_pmc_values_{};
+    bool op_pmc_enabled_ = false;
+    bool op_pmc_failed_ = false;
+#else
+    bool op_pmc_failed_ = false;
+#endif
 #endif
 
     // ================================================================
@@ -504,6 +545,32 @@ private:
         measured_iters_done_ = 0;
         profile_emitted_ = false;
 
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+        op_pmc_group_name_.clear();
+        op_pmc_specs_.clear();
+        op_pmc_values_.clear();
+        op_pmc_enabled_ = false;
+        op_pmc_failed_ = false;
+
+        if (const char* group = std::getenv("LLMES_HFT_MACRO_OP_PMC_GROUP");
+            group != nullptr && group[0] != '\0') {
+            op_pmc_group_name_ = group;
+            op_pmc_specs_ = benchmark_runner::HftMacroPerfGroupSpec(op_pmc_group_name_);
+            if (op_pmc_specs_.empty()) {
+                std::cerr << "unknown hft_macro op PMC group: "
+                          << op_pmc_group_name_ << "\n";
+                op_pmc_failed_ = true;
+            } else if (!op_perf_.Open(op_pmc_specs_)) {
+                std::cerr << "failed to open hft_macro op PMC group: "
+                          << op_pmc_group_name_ << "\n";
+                op_pmc_failed_ = true;
+            } else {
+                op_pmc_enabled_ = true;
+                op_pmc_values_.assign(op_pmc_specs_.size(), 0);
+            }
+        }
+#endif
+
         static constexpr std::array<const char*, static_cast<std::size_t>(OpBucket::kCount)>
             kNames = {
                 "add_rest",
@@ -532,6 +599,9 @@ private:
             p.ns_samples.clear();
             p.market_levels_samples.clear();
             p.market_filled_samples.clear();
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+            p.total_pmc.assign(op_pmc_specs_.size(), 0);
+#endif
 
             const std::size_t reserve =
                 std::max<std::size_t>(32, (reserve_total * weights[i]) / 100);
@@ -544,12 +614,24 @@ private:
     }
 
     void RecordProfileSample(const ExecuteOutcome& outcome, double ns,
-                             std::uint64_t cycles) {
+                             std::uint64_t cycles
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+                             , const std::vector<std::uint64_t>* pmc_values
+#endif
+                             ) {
         auto& p = op_profile_[static_cast<std::size_t>(outcome.bucket)];
         ++p.count;
         p.total_ns += ns;
         p.total_cycles += cycles;
         p.ns_samples.push_back(ns);
+
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+        if (pmc_values != nullptr && pmc_values->size() == p.total_pmc.size()) {
+            for (std::size_t i = 0; i < pmc_values->size(); ++i) {
+                p.total_pmc[i] += (*pmc_values)[i];
+            }
+        }
+#endif
 
         if (outcome.bucket == OpBucket::kMarket) {
             p.market_levels_sum += outcome.market_levels_touched;
@@ -727,7 +809,110 @@ private:
                   << "\n";
             }
         }
+
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+        EmitPmcProfile(total_ops);
+#endif
     }
+
+#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
+    void EmitPmcProfile(std::uint64_t total_ops) const {
+        if (!op_pmc_enabled_ || total_ops == 0) return;
+
+        const char* out_path = std::getenv("LLMES_HFT_MACRO_OP_PMC_OUT");
+        const bool write_csv = (out_path != nullptr && out_path[0] != '\0');
+        if (write_csv) {
+            benchmark_runner::EnsureCsvHeader(
+                out_path,
+                "scenario,version_tag,commit_sha,trial_id,seed,orders,levels,batch_size,"
+                "warmup_iters,iters,pmc_group,op_type,count,share,event_name,"
+                "event_total,event_per_op,weighted_event_per_macro_op");
+        }
+
+        const auto& event_names = op_perf_.EventNames();
+        std::cout << "macro_op_pmc_profile"
+                  << " scenario=" << Name()
+                  << " version_tag=" << profile_args_.version_tag
+                  << " commit_sha=" << profile_args_.commit_sha
+                  << " trial_id=" << profile_args_.trial_id
+                  << " seed=" << profile_args_.seed
+                  << " orders=" << profile_args_.orders
+                  << " levels=" << profile_args_.levels
+                  << " batch_size=" << profile_args_.batch_size
+                  << " warmup_iters=" << profile_args_.warmup_iters
+                  << " iters=" << profile_args_.iters
+                  << " pmc_group=" << op_pmc_group_name_
+                  << " total_ops=" << total_ops
+                  << "\n";
+
+        for (const auto& p : op_profile_) {
+            const double share = static_cast<double>(p.count) /
+                                 static_cast<double>(total_ops);
+            for (std::size_t i = 0; i < p.total_pmc.size(); ++i) {
+                const char* event_name =
+                    (i < event_names.size()) ? event_names[i].c_str() : "unknown";
+                const double event_per_op =
+                    (p.count > 0)
+                        ? static_cast<double>(p.total_pmc[i]) /
+                              static_cast<double>(p.count)
+                        : 0.0;
+                const double weighted_event_per_macro_op = share * event_per_op;
+
+                std::cout << "macro_op_pmc_profile"
+                          << " op_type=" << p.name
+                          << " pmc_group=" << op_pmc_group_name_
+                          << " event_name=" << event_name
+                          << " count=" << p.count
+                          << " share=" << share
+                          << " event_total=" << p.total_pmc[i]
+                          << " event_per_op=" << event_per_op
+                          << " weighted_event_per_macro_op="
+                          << weighted_event_per_macro_op
+                          << "\n";
+
+                if (write_csv) {
+                    std::ofstream f(out_path, std::ios::app);
+                    f << Name()
+                      << ","
+                      << profile_args_.version_tag
+                      << ","
+                      << profile_args_.commit_sha
+                      << ","
+                      << profile_args_.trial_id
+                      << ","
+                      << profile_args_.seed
+                      << ","
+                      << profile_args_.orders
+                      << ","
+                      << profile_args_.levels
+                      << ","
+                      << profile_args_.batch_size
+                      << ","
+                      << profile_args_.warmup_iters
+                      << ","
+                      << profile_args_.iters
+                      << ","
+                      << op_pmc_group_name_
+                      << ","
+                      << p.name
+                      << ","
+                      << p.count
+                      << ","
+                      << share
+                      << ","
+                      << event_name
+                      << ","
+                      << p.total_pmc[i]
+                      << ","
+                      << event_per_op
+                      << ","
+                      << weighted_event_per_macro_op
+                      << "\n";
+                }
+            }
+        }
+    }
+#endif
 #endif
 
     // ================================================================
