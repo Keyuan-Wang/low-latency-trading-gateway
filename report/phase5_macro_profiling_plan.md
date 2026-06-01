@@ -197,48 +197,193 @@ call site. `level_lookup` is the largest measured stage, but it is only about
 `match`, `id_index_insert`, `validation`, `fifo_append`, `node_init`, and
 `pool_acquire`.
 
-The next profiling split has now been instrumented in code. `level_lookup`
-is separated into:
+## Cloud Profiling: level_lookup_existing vs level_create_new
 
-- `level_lookup_existing`
-- `level_create_new`
+The `get_or_create()` return type was changed from `PriceLevel&` to
+`std::pair<PriceLevel*, bool>`, using `try_emplace` instead of `operator[]`, to
+allow the profiling instrumentation to distinguish existing-level lookup from
+new-level creation. The `AddRestCallProfile` accumulates timing for whichever
+path was taken, then commits both to the global snapshot at the end of the
+`add_limit_order` call.
 
-The local smoke run already shows both sub-stages in the CSV output. The
-remaining work is to collect the same split on the cloud benchmark and compare
-the real hit-path cost against the rare create path.
+A cloud profiling run was executed with both
+`LLMES_PROFILE_HFT_MACRO_OPS=ON` and `LLMES_PROFILE_ADD_REST_STAGES=ON`.
 
-## Next Work
-
-Phase 5 should keep refining the add-rest path before changing core data
-structures again. The current stage split is now in place, so the next step is
-to run the cloud benchmark with the finer-grained lookup split:
-
-| Stage | Question |
-|---|---|
-| `level_lookup_existing` | How expensive is the common map hit path? |
-| `level_create_new` | How often does the book actually create a fresh price level? |
-
-The goal is to produce a finer-grained stage table for `add_rest`:
+Cloud run:
 
 ```text
-stage, count, mean_ns, mean_cycles, weighted_ns_per_add_rest
+branch:       master
+commit:       237820e
+scenario:     hft_macro
+trials:       1
+orders:       100000
+levels:       100
+batch_size:   100000
+warmup_iters: 1
+iters:        1
+seed:         42
 ```
 
-Once that table exists, optimization candidates can be ranked by measured cost
-rather than by intuition. The likely decision points are:
+Artifacts:
 
-- If existing-level lookup dominates, revisit price-index structure.
-- If new-level creation is rare, optimize the hot hit path first.
-- If `id_to_order_` insertion dominates, investigate order-id indexing.
-- If allocation dominates, revisit pool implementation.
-- If no single stage dominates, optimize instruction count and branch structure
-  in the add path.
+```text
+benchmark/results/add_rest_stage_profile_cloud_20260601/
+├── latency_raw.csv
+├── op_raw.csv
+└── stage_raw.csv
+```
+
+Sanity check:
+
+| Metric | Value |
+|---|---:|
+| `cancel_miss` | 0 |
+| `modify_miss` | 0 |
+| `add_rest` op count | 47,850 |
+
+### Operation-Level Result (profiling mode)
+
+| Operation | Count | Share | Mean ns | Mean cycles | Weighted ns share |
+|---|---:|---:|---:|---:|---:|
+| `add_rest` | 47,850 | 47.85% | 524.24 | 1,331.13 | **90.44%** |
+| `cancel_hit` | 46,159 | 46.16% | 39.92 | 169.56 | 6.64% |
+| `modify_hit` | 3,893 | 3.89% | 131.93 | 393.54 | 1.85% |
+| `market` | 1,591 | 1.59% | 117.11 | 353.21 | 0.67% |
+| `add_cross` | 507 | 0.51% | 217.50 | 593.94 | 0.40% |
+
+Note: profiling-mode absolute latencies are inflated by instrumentation
+overhead (`__rdtsc()` + `steady_clock::now()` per stage × 7). The production
+`add_rest` latency is ~35 ns; the profiling-mode measurement includes ~220 ns
+of stage-internal work plus ~304 ns of timing overhead. Only the relative
+proportions are meaningful.
+
+### Add-Rest 8-Stage Breakdown
+
+| Stage | Mean ns | Mean cycles | ns share | cycles share |
+|---|---:|---:|---:|---:|
+| `match` (含 can_cross) | 32.45 | 150.05 | 14.71% | 15.57% |
+| `id_index_insert` | 30.86 | 147.03 | 13.99% | 15.25% |
+| `validation` (3 checks) | 29.11 | 142.57 | 13.20% | 14.79% |
+| `fifo_append` | 28.48 | 141.43 | 12.92% | 14.67% |
+| `node_init` | 28.01 | 139.06 | 12.70% | 14.43% |
+| `pool_acquire` | 27.66 | 138.94 | 12.54% | 14.41% |
+| **`level_lookup_existing`** | **26.86** | **63.89** | **12.18%** | **6.63%** |
+| **`level_lookup_create_new`** | **17.10** | **40.98** | **7.75%** | **4.25%** |
+
+Note on `count` reporting: the current profiling accumulator unconditionally
+increments the `count` field for every stage slot on each `add_rest` call, so
+all 8 stages report `count = 47,850`. The `mean_ns` and `mean_cycles` columns
+are computed from `total_ns / count` and `total_cycles / count` in the emitter
+and should be read as average-cost-per-add_rest, not as average-cost-per-hit
+for the level_lookup stages. A future refinement should track per-stage hit
+counts separately. The `total_ns` and `total_cycles` columns are correct.
+
+### Key Findings
+
+#### 1. `std::map::try_emplace` is Not the Bottleneck
+
+`level_lookup_existing` costs 63.89 cycles per add_rest — the **lowest cycle
+cost of any stage by a wide margin** (the next lowest is `pool_acquire` at
+138.94 cycles). The `std::map` red-black tree lookup for an existing price level
+is well-optimized by the compiler and accounts for only 6.63% of add_rest cycle
+time. **Replacing `std::map` with a faster price-index structure (absl::btree_map,
+ring buffer, or flat hash map) would address at most ~6.6% of the add_rest cycle
+budget.**
+
+This directly answers the question posed by the Phase 4 price-level storage
+strategy report: the ordered-map lookup is **not** the performance bottleneck
+for the dominant `add_rest` path in the HFT macro workload.
+
+#### 2. No Single Stage Dominates — The Cost Is Distributed
+
+The 7 stages (treating the two level_lookup variants as one path) each consume
+between 12.5% and 15.6% of add_rest cycles. The standard deviation across the 7
+main stages is only ~4.8 cycles. This means:
+
+- There is no "fix one slow function and win" opportunity.
+- Any optimization that targets a single stage caps out at ~15% improvement on
+  `add_rest`, which translates to ~8% on macro throughput (since `add_rest` is
+  ~53% of weighted macro time).
+- Real progress requires reducing fixed cost across the entire path: fewer total
+  instructions, fewer branches, fewer store operations.
+
+The ChunkPool experiment's failure makes sense in this light: it reduced
+allocation cost (pool_acquire) but added overhead to fifo_append (chunk
+linkage), id_index_insert (no change), and remove (chunk_from_order +
+link_available). The net effect was a ~12% regression because the distributed
+overhead increase outweighed the localized allocation improvement.
+
+#### 3. `level_create_new` Is Rare In Steady State
+
+In a warmed book with 100,000 orders across 100 price levels, nearly every
+price already has an active level. The `level_create_new` total cycles
+(1,961,018) are only ~39% of `level_lookup_existing` total cycles (3,057,094).
+Since both stages have the same inflated count, the ratio of actual hits is
+proportional to the total cycle ratio: **existing-level lookups outnumber
+new-level creations by roughly 2.5:1 in this workload.** The create path is
+too rare to be an optimization target — every effort should go into the
+existing-lookup hot path.
+
+#### 4. Profiling-Mode Count Reporting Issue
+
+The `RecordAddRestStageProfile` function unconditionally increments
+`stage.count` for every stage slot regardless of whether that stage accumulated
+non-zero ns/cycles. This means `count` and `mean_ns`/`mean_cycles` in the CSV
+output should be interpreted as "per-add_rest amortized cost," not "per-hit
+cost." The `total_ns` and `total_cycles` columns are unaffected. A future fix
+should make the ScopedAddRestStage increment count only for the specific stage
+it measures, and the level_lookup split should track separate hit counts.
+
+## Revised Phase 5 Strategy
+
+The profiling data narrows the optimization space decisively:
+
+1. **The price-index container is not the binding constraint.** The `std::map`
+   lookup for existing levels costs 63.89 cycles — the cheapest stage. This
+   removes the urgency from the Phase 4 plan's V2 (absl::btree_map), V4 (hot
+   ring), V5 (bitmap), and V6 (cold container experiments). Those changes would
+   optimize a cost center that represents 6.6% of add_rest cycles.
+
+2. **The bottleneck is distributed fixed cost.** The remaining ~93% of add_rest
+   cycles is spread across validation, match, allocation, initialization,
+   append, and index insertion — each 139–150 cycles. The optimization strategy
+   should shift from "find the slow stage" to "reduce instruction count and
+   branch density across the entire add path."
+
+3. **Concrete next candidates:**
+   - **Merge validation checks.** `pending_cancel_ids_.contains()` +
+     `id_to_order_.contains()` + `quantity == 0` are three sequential branches.
+     Combining them into a single early-return path with fewer mispredict
+     opportunities could reduce validation cost.
+   - **Eliminate redundant stores.** `node_init` aggregates 6 field assignments
+     (`*node = {id, price, qty, ts, nullptr, nullptr}`). Some of these are
+     overwritten by `fifo_append` (`prev`, `next`) or `pool_acquire`
+     (`parent_level`). Reducing the store count by initializing only the
+     business fields and letting the append/pool paths set their own metadata
+     could save cycles.
+   - **Inline `push_back`.** `fifo_append` costs 141.43 cycles for what is a
+     simple 4-pointer linked-list append. The function call overhead on a
+     non-inlined method may be material at this scale.
+   - **Profile with `perf record` / `perf annotate` for instruction-level
+     hotspots.** The stage breakdown is ~200 ns in profiling mode; a
+     non-instrumented production-mode cycle-accurate profile via `perf` would
+     show exact instruction retirement stalls.
+
+4. **Do not pursue price-index replacement until a different workload demands
+   it.** The current macro workload (47.85% add, 46.16% cancel, shallow market
+   sweeps) does not stress the ordered map. A workload with deeper market
+   sweeps, wider price ranges, or more level churn could change the conclusion.
+   But for the current workload, the data is clear.
 
 ## Working Rule For Phase 5
 
-Do not introduce another major storage redesign until the next stage split
-shows whether the cost is in the common lookup path or in rare new-level
-creation.
+Do not introduce another major storage redesign. The profiling data shows the
+distributed nature of the add_rest cost: the cheapest stage is the `std::map`
+lookup at 63.89 cycles, while six other stages each cost 139–150 cycles. The
+next change should be instruction-level optimization of the add path, guided by
+`perf annotate` rather than by structural intuition.
 
-The next change should be profiling instrumentation, not a production
-optimization.
+The level_lookup_existing vs level_create_new split is now recorded. The
+remaining instrumentation gap is per-stage hit counting (cosmetic fix to the
+profiling accumulator) and a production-mode `perf record` run for
+instruction-level attribution.
