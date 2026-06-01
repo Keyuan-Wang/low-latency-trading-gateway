@@ -14,15 +14,97 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <numeric>
 #include <string>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 namespace benchmark_runner {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+
+/**
+	* @brief Optional `perf record` region control via the perf control FIFO.
+	*
+	* When the process is launched under
+	*   `perf record --control=fifo:<ctl>,<ack> -D -1 -- <bench> ...`
+	* and the FIFO paths are exported as @c LLMES_PERF_CTL_FIFO /
+	* @c LLMES_PERF_ACK_FIFO, this helper toggles sampling so that only the
+	* measured RunOp batch is recorded.  Warmup, Setup(), and Teardown() run
+	* with sampling disabled, exactly mirroring the PMC enable/disable window.
+	*
+	* This keeps `perf report` / `perf annotate` focused on the engine hot path
+	* instead of the heavy benchmark scaffolding (book rebuild, 500k-event
+	* warmup, batch pre-generation).
+	*
+	* When the environment variables are absent the helper is inert and adds no
+	* overhead, so normal benchmark runs are unaffected.
+	*/
+class PerfRecordControl {
+	public:
+	PerfRecordControl() {
+#if defined(__linux__)
+		const char* ctl = std::getenv("LLMES_PERF_CTL_FIFO");
+		const char* ack = std::getenv("LLMES_PERF_ACK_FIFO");
+		if (ctl == nullptr || ack == nullptr || ctl[0] == '\0' || ack[0] == '\0') {
+			return;
+		}
+		// Order matches perf: it opens ctl for reading and ack for writing at
+		// startup, so these blocking opens self-synchronize with perf.
+		ctl_fd_ = ::open(ctl, O_WRONLY);
+		ack_fd_ = ::open(ack, O_RDONLY);
+		enabled_ = (ctl_fd_ >= 0 && ack_fd_ >= 0);
+		if (!enabled_) {
+			Close();
+		}
+#endif
+	}
+
+	~PerfRecordControl() { Close(); }
+
+	PerfRecordControl(const PerfRecordControl&) = delete;
+	PerfRecordControl& operator=(const PerfRecordControl&) = delete;
+
+	[[nodiscard]] bool enabled() const noexcept { return enabled_; }
+
+	void Enable() noexcept { SendCommand("enable\n"); }
+	void Disable() noexcept { SendCommand("disable\n"); }
+
+	private:
+	void SendCommand([[maybe_unused]] const char* cmd) noexcept {
+#if defined(__linux__)
+		if (!enabled_) return;
+		const ssize_t w = ::write(ctl_fd_, cmd, std::strlen(cmd));
+		(void)w;
+		// Block on the ack so the enable/disable takes effect outside the
+		// timed window, never partway through the measured batch.
+		char buf[16];
+		const ssize_t r = ::read(ack_fd_, buf, sizeof(buf));
+		(void)r;
+#endif
+	}
+
+	void Close() noexcept {
+#if defined(__linux__)
+		if (ctl_fd_ >= 0) ::close(ctl_fd_);
+		if (ack_fd_ >= 0) ::close(ack_fd_);
+		ctl_fd_ = -1;
+		ack_fd_ = -1;
+#endif
+		enabled_ = false;
+	}
+
+	int ctl_fd_ = -1;
+	int ack_fd_ = -1;
+	bool enabled_ = false;
+};
 
 /**
 	* @brief Parse CLI arguments into an Args struct.
@@ -112,12 +194,19 @@ int RunScenario(IBenchScenario& scenario, int argc, char** argv) {
 		return 3;
 	}
 
+	// Inert unless launched under `perf record --control=fifo` with the FIFO
+	// paths exported.  When active, it restricts perf sampling to the measured
+	// RunOp batch only.
+	PerfRecordControl perf_record_ctl{};
+
 	// --- measurement phase ---
 	// Each iteration: Setup (untimed) → timing window → batch_size × RunOp
 	// (timed) → Teardown (untimed).  Latency records wall-clock per op;
 	// PMC enables counters only during the RunOp batch.
 	for (std::uint64_t i = 0; i < args.iters; ++i) {
 		scenario.Setup(args, iter_counter);
+
+		if (perf_record_ctl.enabled()) perf_record_ctl.Enable();
 
 		if (args.metric == MetricMode::Pmc && !perf.ResetEnable()) {
 			return 3;
@@ -132,6 +221,8 @@ int RunScenario(IBenchScenario& scenario, int argc, char** argv) {
 		if (args.metric == MetricMode::Pmc) {
 			if (!perf.Disable()) return 3;
 		}
+
+		if (perf_record_ctl.enabled()) perf_record_ctl.Disable();
 
 		scenario.Teardown();
 		++iter_counter;
