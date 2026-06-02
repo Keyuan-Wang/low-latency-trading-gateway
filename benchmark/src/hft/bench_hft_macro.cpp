@@ -51,25 +51,32 @@ namespace {
 // ------------------------------------------------------------------
 //  Pre-generated book-operation parameters.
 //  One PendingOp per RunOp() call -- generated in Setup(), consumed in
-//  RunOp(), so RNG and map lookups are outside the timed window.
+//  RunOp(), so RNG, ID-to-handle lookups, and tracking updates stay outside
+//  the timed window.
 // ------------------------------------------------------------------
 struct PendingOp {
     enum Type : std::uint8_t { kLimitAdd, kCancel, kModify, kMarket };
-    Type type;
+    Type type = kLimitAdd;
 
     // kLimitAdd / kModify
-    matching::Side side;
-    std::int64_t price;
-    std::uint64_t qty;
+    matching::Side side = matching::Side::Buy;
+    std::int64_t price = 0;
+    std::uint64_t qty = 0;
 
     // kCancel / kModify
-    std::uint64_t target_id;
+    std::uint64_t target_id = 0;
+    matching::OrderHandle target_handle{matching::kInvalidHandle};
 
     // kMarket
-    std::uint64_t market_qty;
+    std::uint64_t market_qty = 0;
+    std::uint64_t market_levels_touched = 0;
+    std::uint64_t market_filled_qty = 0;
+
+    // Precomputed during setup for operation-profile reporting.
+    bool add_rests = false;
 
     // All
-    std::uint64_t oid;
+    std::uint64_t oid = 0;
 };
 
 #if LLMES_PROFILE_HFT_MACRO_OPS
@@ -115,7 +122,6 @@ public:
         // --- Warmup (untimed, uses the old generate-execute-track loop) ---
         resting_orders_.clear();
         book_handles_.clear();
-        planning_handles_.clear();
         resting_ids_.clear();
         ask_level_counts_.clear();
         bid_level_counts_.clear();
@@ -131,20 +137,21 @@ public:
         }
 
         update_best_prices();
+        const auto base_resting_orders = resting_orders_;
         book_ = build_book_from_tracking(pool, book_handles_);
-        planning_book_ = build_book_from_tracking(pool, planning_handles_);
 
         // --- Pre-generate the measured batch ---
-        // All event params are decided now.  RunOp() just replays them on
-        // the book -- no RNG, no map lookups, no tracking updates inside
-        // the timed window.
+        // All event params and handles are decided now.  RunOp() just calls
+        // the requested OrderBook operation.
         pending_.clear();
         pregen_queue_.clear();
         while (pending_.size() < args.batch_size) {
             generate_pending_one();
         }
         pending_.resize(args.batch_size);  // discard excess from clusters
-        planning_book_.reset();
+
+        resting_orders_ = base_resting_orders;
+        book_ = build_book_from_tracking(pool, book_handles_);
     }
 
     bool RunOp(const benchmark_runner::Args& args, std::uint64_t iter_idx,
@@ -258,7 +265,6 @@ private:
     // ================================================================
 
     std::unique_ptr<matching::OrderBook> book_;
-    std::unique_ptr<matching::OrderBook> planning_book_;
     benchmark_runner::SplitMix64 event_rng_{42};
     benchmark_runner::SplitMix64 param_rng_{42};
     std::uint64_t id_counter_ = 0;
@@ -267,7 +273,6 @@ private:
     // pre-generation step in Setup, NOT during RunOp).
     absl::flat_hash_map<std::uint64_t, RestingMeta> resting_orders_;
     absl::flat_hash_map<std::uint64_t, HandleMeta> book_handles_;
-    absl::flat_hash_map<std::uint64_t, HandleMeta> planning_handles_;
     std::vector<std::uint64_t> resting_ids_;
     std::map<std::int64_t, std::uint64_t, std::less<>> ask_level_counts_;
     std::map<std::int64_t, std::uint64_t, std::greater<>> bid_level_counts_;
@@ -363,11 +368,12 @@ private:
         op.oid = id_counter_++;
 
         auto const res =
-            planning_book_->add_limit_order(op.oid, op.side, op.price, op.qty, op.oid);
-        apply_trade_fills(res.trades, &planning_handles_);
+            book_->add_limit_order(op.oid, op.side, op.price, op.qty, op.oid);
+        apply_trade_fills(res.trades, &book_handles_);
         if (res.code == matching::ErrorCode::Success && res.remaining_quantity > 0) {
             track_add_predicted(op.oid, op.side, op.price, res.remaining_quantity);
-            planning_handles_[op.oid] = HandleMeta{res.handle, res.remaining_quantity};
+            book_handles_[op.oid] = HandleMeta{res.handle, res.remaining_quantity};
+            op.add_rests = true;
         }
 
         pending_.push_back(op);
@@ -381,23 +387,25 @@ private:
             std::uint64_t const target = select_cancel_target();
             if (target == 0) break;
 
-            auto handle_it = planning_handles_.find(target);
-            if (handle_it == planning_handles_.end()) {
+            auto book_handle_it = book_handles_.find(target);
+            if (book_handle_it == book_handles_.end()) {
                 track_remove_predicted(target);
                 continue;
             }
 
-            auto const code = planning_book_->cancel_order(handle_it->second.handle);
+            auto const code = book_->cancel_order(book_handle_it->second.handle);
             if (code != matching::ErrorCode::Success) {
-                planning_handles_.erase(handle_it);
+                book_handles_.erase(book_handle_it);
                 track_remove_predicted(target);
                 continue;
             }
-            planning_handles_.erase(handle_it);
+            matching::OrderHandle const target_handle = book_handle_it->second.handle;
+            book_handles_.erase(book_handle_it);
 
             PendingOp op;
             op.type = PendingOp::kCancel;
             op.target_id = target;
+            op.target_handle = target_handle;
             op.oid = 0;
             pending_.push_back(op);
             track_remove_predicted(target);
@@ -436,28 +444,29 @@ private:
         op.target_id = target;
         op.oid = id_counter_++;
 
-        auto handle_it = planning_handles_.find(op.target_id);
-        if (handle_it == planning_handles_.end()) {
+        auto book_handle_it = book_handles_.find(op.target_id);
+        if (book_handle_it == book_handles_.end()) {
             track_remove_predicted(target);
             pending_limit_add();
             return;
         }
+        op.target_handle = book_handle_it->second.handle;
 
         auto const res =
-            planning_book_->modify_order(handle_it->second.handle, op.side, op.price, op.qty, op.oid);
+            book_->modify_order(book_handle_it->second.handle, op.side, op.price, op.qty, op.oid);
         if (res.code != matching::ErrorCode::Success) {
-            planning_handles_.erase(handle_it);
+            book_handles_.erase(book_handle_it);
             track_remove_predicted(target);
             pending_limit_add();
             return;
         }
 
-        planning_handles_.erase(handle_it);
+        book_handles_.erase(book_handle_it);
         track_remove_predicted(target);
-        apply_trade_fills(res.trades, &planning_handles_);
+        apply_trade_fills(res.trades, &book_handles_);
         if (res.remaining_quantity > 0) {
             track_add_predicted(target, op.side, op.price, res.remaining_quantity);
-            planning_handles_[target] = HandleMeta{res.handle, res.remaining_quantity};
+            book_handles_[target] = HandleMeta{res.handle, res.remaining_quantity};
         }
         pending_.push_back(op);
     }
@@ -478,17 +487,20 @@ private:
         else if (mroll < 98)
             op.market_qty = std::max<std::uint64_t>(1, total / 2);
         else
-            op.market_qty = static_cast<std::uint64_t>(total * 0.8);
+            op.market_qty =
+                std::max<std::uint64_t>(1, static_cast<std::uint64_t>(total * 0.8));
 
         op.oid = id_counter_++;
         auto const res =
-            planning_book_->add_market_order(op.oid, op.side, op.market_qty, op.oid);
-        apply_trade_fills(res.trades, &planning_handles_);
+            book_->add_market_order(op.oid, op.side, op.market_qty, op.oid);
+        apply_trade_fills(res.trades, &book_handles_);
+        op.market_filled_qty = res.filled_quantity;
+        op.market_levels_touched = CountTouchedLevels(res.trades);
         pending_.push_back(op);
     }
 
     // ================================================================
-    //  Timed execution -- RunOp calls this, pure book ops only
+    //  Timed execution -- RunOp calls this, pure OrderBook operation only
     // ================================================================
 
     ExecuteOutcome execute_pending(std::size_t idx, std::uint64_t& ok) {
@@ -499,25 +511,13 @@ private:
         case PendingOp::kLimitAdd: {
             auto const res =
                 book_->add_limit_order(op.oid, op.side, op.price, op.qty, op.oid);
-            apply_book_trade_fills(res.trades, book_handles_);
-            if (res.code == matching::ErrorCode::Success &&
-                res.remaining_quantity > 0) {
-                book_handles_[op.oid] = HandleMeta{res.handle, res.remaining_quantity};
-            }
             if (res.code == matching::ErrorCode::Success) ++ok;
-            outcome.bucket =
-                (res.code == matching::ErrorCode::Success && res.remaining_quantity > 0)
-                    ? OpBucket::kAddRest
-                    : OpBucket::kAddCross;
+            outcome.bucket = op.add_rests ? OpBucket::kAddRest : OpBucket::kAddCross;
             break;
         }
         case PendingOp::kCancel: {
-            auto handle_it = book_handles_.find(op.target_id);
-            auto const code = (handle_it == book_handles_.end())
-                ? matching::ErrorCode::UnknownOrderId
-                : book_->cancel_order(handle_it->second.handle);
+            auto const code = book_->cancel_order(op.target_handle);
             if (code == matching::ErrorCode::Success) {
-                book_handles_.erase(handle_it);
                 ++ok;
                 outcome.bucket = OpBucket::kCancelHit;
             } else {
@@ -526,40 +526,22 @@ private:
             break;
         }
         case PendingOp::kModify: {
-            auto handle_it = book_handles_.find(op.target_id);
-            const bool existed_before = handle_it != book_handles_.end();
-            auto const res = existed_before
-                ? book_->modify_order(handle_it->second.handle, op.side, op.price,
-                                      op.qty, op.oid)
-                : matching::AddResult{matching::ErrorCode::UnknownOrderId,
-                                      op.qty,
-                                      0,
-                                      op.qty,
-                                      matching::kInvalidHandle,
-                                      {}};
-            if (existed_before) book_handles_.erase(handle_it);
-            apply_book_trade_fills(res.trades, book_handles_);
-            if (res.code == matching::ErrorCode::Success &&
-                res.remaining_quantity > 0) {
-                book_handles_[op.target_id] =
-                    HandleMeta{res.handle, res.remaining_quantity};
-            }
+            auto const res = book_->modify_order(op.target_handle, op.side, op.price,
+                                                 op.qty, op.oid);
             if (res.code == matching::ErrorCode::Success) ++ok;
-            outcome.bucket =
-                existed_before ? OpBucket::kModifyHit : OpBucket::kModifyMiss;
+            outcome.bucket = OpBucket::kModifyHit;
             break;
         }
         case PendingOp::kMarket: {
             auto const res =
                 book_->add_market_order(op.oid, op.side, op.market_qty, op.oid);
-            apply_book_trade_fills(res.trades, book_handles_);
             if (res.code == matching::ErrorCode::Success ||
                 res.code == matching::ErrorCode::MarketRemainderCancelled)
                 ++ok;
 
             outcome.bucket = OpBucket::kMarket;
-            outcome.market_filled_qty = res.filled_quantity;
-            outcome.market_levels_touched = CountTouchedLevels(res.trades);
+            outcome.market_filled_qty = op.market_filled_qty;
+            outcome.market_levels_touched = op.market_levels_touched;
             break;
         }
         }
@@ -1028,20 +1010,6 @@ private:
         }
     }
 
-    static void apply_book_trade_fills(
-        const std::vector<matching::Trade>& trades,
-        absl::flat_hash_map<std::uint64_t, HandleMeta>& handles) {
-        for (const auto& trade : trades) {
-            auto it = handles.find(trade.maker_order_id);
-            if (it == handles.end()) continue;
-            if (trade.quantity >= it->second.qty) {
-                handles.erase(it);
-            } else {
-                it->second.qty -= trade.quantity;
-            }
-        }
-    }
-
     void compact_resting_ids() {
         resting_ids_.clear();
         resting_ids_.reserve(resting_orders_.size());
@@ -1181,7 +1149,8 @@ private:
         else if (mroll < 98)
             qty = std::max<std::uint64_t>(1, total / 2);
         else
-            qty = static_cast<std::uint64_t>(total * 0.8);
+            qty = std::max<std::uint64_t>(1,
+                                          static_cast<std::uint64_t>(total * 0.8));
         std::uint64_t const oid = id_counter_++;
         auto const res =
             book_->add_market_order(oid, side, qty, oid);
@@ -1240,6 +1209,10 @@ private:
     void enqueue_cluster_pending() {
         int const n = draw_cluster_size();
         if (n <= 1) return;
+
+        std::vector<PendingOp> cluster_ops;
+        cluster_ops.reserve(static_cast<std::size_t>(n - 1));
+
         std::int64_t const best = (best_ask_ > 0) ? best_ask_ : 1000;
         for (int i = 0; i < n && !resting_orders_.empty(); ++i) {
             for (int attempt = 0; attempt < 50; ++attempt) {
@@ -1248,29 +1221,36 @@ private:
                 auto const it = resting_orders_.find(id);
                 if (it == resting_orders_.end()) continue;
                 if (std::abs(it->second.price - best) <= 3) {
-                    auto handle_it = planning_handles_.find(id);
-                    if (handle_it == planning_handles_.end()) {
+                    auto book_handle_it = book_handles_.find(id);
+                    if (book_handle_it == book_handles_.end()) {
                         track_remove_predicted(id);
                         continue;
                     }
-                    auto const code =
-                        planning_book_->cancel_order(handle_it->second.handle);
+                    auto const code = book_->cancel_order(book_handle_it->second.handle);
                     if (code != matching::ErrorCode::Success) {
-                        planning_handles_.erase(handle_it);
+                        book_handles_.erase(book_handle_it);
                         track_remove_predicted(id);
                         continue;
                     }
-                    planning_handles_.erase(handle_it);
+                    matching::OrderHandle const target_handle =
+                        book_handle_it->second.handle;
+                    book_handles_.erase(book_handle_it);
                     PendingOp op;
                     op.type = PendingOp::kCancel;
                     op.target_id = id;
+                    op.target_handle = target_handle;
                     op.oid = 0;
-                    pregen_queue_.push_back(op);
+                    cluster_ops.push_back(op);
                     track_remove_predicted(id);
                     break;
                 }
             }
         }
+
+        // pregen_queue_ is drained with pop_back(); reverse append preserves
+        // the same cancel order already applied to the dry-run book.
+        pregen_queue_.insert(pregen_queue_.end(),
+                             cluster_ops.rbegin(), cluster_ops.rend());
     }
 
     void enqueue_cluster_legacy() {
