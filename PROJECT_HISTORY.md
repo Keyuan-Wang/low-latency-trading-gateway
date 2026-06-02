@@ -1,8 +1,6 @@
 # Project Experiment Log
 
-This file records the project history that is currently documented in this
-repository: design attempts, benchmark campaigns, results, and conclusions.
-It intentionally does not cover undocumented discussions or experiments.
+This file records the project history that is currently documented in this repository: design attempts, benchmark campaigns, results, and conclusions. It intentionally does not cover undocumented discussions or experiments.
 
 ## Source Records
 
@@ -12,7 +10,10 @@ The notes below are based on:
 - `report/phase2b_to_phase_2e_comparison.md`
 - `report/phase3_hft_benchmark_design.md`
 - `report/phase4_price_level_storage_strategy.md`
+- `report/phase4_hft_macro_optimization_priority.md`
+- `report/phase5_macro_profiling_plan.md`
 - `benchmark/results/campaign_20260601_1319/`
+- `benchmark/results/hft_macro_perf_record_cloud_20260601/`
 - `server_results/macro_op_profile_cloud_t1/`
 
 ## Phase 1: Correctness-First Baseline
@@ -27,16 +28,14 @@ The core storage model was:
 - each price level stored as `std::list<Order>`
 - cancel and modify implemented by scanning the book
 
-This design was simple and useful as a correctness reference, but it had two
-major performance costs:
+This design was simple and useful as a correctness reference, but it had two major performance costs:
 
 - every resting order lived in a separately allocated list node
 - cancel and modify required O(N) traversal
 
 ### Testing
 
-The early benchmark suite measured seven legacy scenarios plus an overall mixed
-workload. The mixed workload used:
+The early benchmark suite measured seven legacy scenarios plus an overall mixed workload. The mixed workload used:
 
 - 35% cancel
 - 30% modify
@@ -46,9 +45,7 @@ workload. The mixed workload used:
 
 ### Result
 
-Phase 1 was retained as a correctness baseline, not as a performance target.
-The benchmark report shows that traversal-heavy paths suffered from high cache
-misses and poor scaling as the book grew.
+Phase 1 was retained as a correctness baseline, not as a performance target. The benchmark report shows that traversal-heavy paths suffered from high cache misses and poor scaling as the book grew.
 
 ## Phase 2a: Pool Storage + Intrusive Per-Level List
 
@@ -56,8 +53,7 @@ misses and poor scaling as the book grew.
 
 Phase 2a replaced `std::list<Order>` with a pool-backed intrusive list.
 
-The main goal was to remove per-order heap allocation and improve traversal
-locality while preserving price-time priority.
+The main goal was to remove per-order heap allocation and improve traversal locality while preserving price-time priority.
 
 The storage model became:
 
@@ -67,8 +63,7 @@ The storage model became:
 
 ### Benchmark Result
 
-At `orders=100000`, `levels=1000`, Phase 2a improved nearly every legacy
-scenario against Phase 1:
+At `orders=100000`, `levels=1000`, Phase 2a improved nearly every legacy scenario against Phase 1:
 
 | Scenario | Main result |
 |---|---:|
@@ -88,8 +83,7 @@ The biggest wins came from:
 - eliminating allocator work on normal order insertion
 - making traversal much more cache friendly
 
-However, cancel and modify were still fundamentally O(N), so the architecture
-could not handle realistic cancel-heavy workloads.
+However, cancel and modify were still fundamentally O(N), so the architecture could not handle realistic cancel-heavy workloads.
 
 ## Phase 2b: O(1) Cancel Index
 
@@ -101,8 +95,7 @@ Phase 2b added an ID-to-order index:
 std::unordered_map<OrderId, Order*> id_to_order_;
 ```
 
-Each `Order` also carried enough metadata to be removed from its intrusive
-level in O(1). This changed cancel from a full book scan into:
+Each `Order` also carried enough metadata to be removed from its intrusive level in O(1). This changed cancel from a full book scan into:
 
 1. hash lookup by order ID
 2. intrusive unlink from the owning level
@@ -133,17 +126,13 @@ The overall mixed workload changed from:
 
 The O(1) cancel index was transformative for realistic mixed workloads.
 
-The cost was real: every add and every matched maker now pays hash-table
-insert/erase overhead. But the workload was cancel/modify dominated, so the
-O(N) -> O(1) cancel improvement dominated the regression in pure matching
-paths.
+The cost was real: every add and every matched maker now pays hash-table insert/erase overhead. But the workload was cancel/modify dominated, so the O(N) -> O(1) cancel improvement dominated the regression in pure matching paths.
 
 ## Phase 2c-2e: Cancel-Index Hash Table Engineering
 
 ### Design Attempts
 
-After Phase 2b, the next question was whether `std::unordered_map` could be
-replaced by a faster hash table for `id_to_order_`.
+After Phase 2b, the next question was whether `std::unordered_map` could be replaced by a faster hash table for `id_to_order_`.
 
 The documented attempts were:
 
@@ -156,8 +145,7 @@ The documented attempts were:
 
 ### HFT Macro Result
 
-The Phase 3 HFT macro benchmark became the decisive workload. On Hetzner CCX23,
-with 10 trials, `orders=100000`, `levels=100`:
+The Phase 3 HFT macro benchmark became the decisive workload. On Hetzner CCX23, with 10 trials, `orders=100000`, `levels=100`:
 
 | Phase | Macro ops/s | ns/op | CPI | cache miss/op |
 |---|---:|---:|---:|---:|
@@ -168,8 +156,7 @@ with 10 trials, `orders=100000`, `levels=100`:
 
 ### Conclusion
 
-The custom hash tables looked plausible in isolation but regressed badly under
-the realistic cancel-heavy macro workload.
+The custom hash tables looked plausible in isolation but regressed badly under the realistic cancel-heavy macro workload.
 
 The main failure mode was memory behavior:
 
@@ -195,8 +182,7 @@ Phase 3 introduced a benchmark suite based on several workload properties:
 
 ### Design
 
-The new benchmark suite split HFT behavior into micro scenarios and a macro
-scenario.
+The new benchmark suite split HFT behavior into micro scenarios and a macro scenario.
 
 Micro scenarios include:
 
@@ -216,16 +202,13 @@ The macro benchmark uses a zero-intelligence style event stream:
 - 5% modify
 - 2% market
 
-Timed operations are pre-generated so that measurement focuses on order-book
-operations instead of random parameter generation.
+Timed operations are pre-generated so that measurement focuses on order-book operations instead of random parameter generation.
 
 ### Conclusion
 
 The HFT macro benchmark became the primary decision metric.
 
-It changed the interpretation of earlier hash-table experiments: designs that
-looked competitive under old or isolated benchmarks could regress sharply under
-realistic mixed HFT access patterns.
+It changed the interpretation of earlier hash-table experiments: designs that looked competitive under old or isolated benchmarks could regress sharply under realistic mixed HFT access patterns.
 
 ## Phase 4: Price-Level Storage Strategy
 
@@ -261,9 +244,7 @@ The Phase 4 report records a key correctness constraint:
 - best price can drift
 - modify can move orders by several ticks
 
-Therefore, a pure fixed-size `std::vector<PriceLevel>` is not a correct final
-design unless the workload is clamped. The report explicitly treats clamping as
-a workload change, not a pure engine optimization.
+Therefore, a pure fixed-size `std::vector<PriceLevel>` is not a correct final design unless the workload is clamped. The report explicitly treats clamping as a workload change, not a pure engine optimization.
 
 ### Strategy
 
@@ -277,21 +258,15 @@ The documented Phase 4 strategy is incremental:
 
 ### `absl::btree_map`
 
-The Phase 4 strategy considered `absl::btree_map` as a possible ordered
-container replacement. The current direction is not to use it as the next
-implementation target because price-level pointer stability is a correctness
-constraint in the current design.
+The Phase 4 strategy considered `absl::btree_map` as a possible ordered container replacement. The current direction is not to use it as the next implementation target because price-level pointer stability is a correctness constraint in the current design.
 
-The safer baseline remains `std::map` until the ownership and cancel metadata
-model is changed enough that moving price-level values cannot invalidate live
-order metadata.
+The safer baseline remains `std::map` until the ownership and cancel metadata model is changed enough that moving price-level values cannot invalidate live order metadata.
 
 ## ChunkPool Experiment
 
 ### Design Hypothesis
 
-A later experiment tested whether per-price-level chunk storage could improve
-cache locality. The motivating hypothesis was:
+A later experiment tested whether per-price-level chunk storage could improve cache locality. The motivating hypothesis was:
 
 - a single large order pool scatters orders from the same hot price level
 - grouping orders into chunks owned by price levels may reduce cache misses
@@ -305,8 +280,7 @@ The current repository keeps a 10-trial campaign under:
 benchmark/results/campaign_20260601_1319/
 ```
 
-The overall summary compares `phase4a` against chunk sizes 16, 32, 64, 128,
-and 256.
+The overall summary compares `phase4a` against chunk sizes 16, 32, 64, 128, and 256.
 
 For the headline HFT macro scenario:
 
@@ -332,21 +306,15 @@ Several micro scenarios regressed relative to `phase4a`, for example:
 
 The recorded results do not support adopting ChunkPool as the next baseline.
 
-For macro HFT, the difference was close to noise. For several micro paths, the
-chunk design regressed. This suggests that the extra chunk bookkeeping and
-pointer operations were not compensated by better locality under the benchmarked
-workload.
+For macro HFT, the difference was close to noise. For several micro paths, the chunk design regressed. This suggests that the extra chunk bookkeeping and pointer operations were not compensated by better locality under the benchmarked workload.
 
-The important process lesson is that the cache-miss hypothesis was not strong
-enough on its own. Future design work should start from profiler evidence on
-the actual macro workload.
+The important process lesson is that the cache-miss hypothesis was not strong enough on its own. Future design work should start from profiler evidence on the actual macro workload.
 
 ## Current Track: HFT Macro Operation Profiling
 
 ### Design
 
-The current master branch adds per-operation profiling to `hft_macro`, guarded
-by:
+The current master branch adds per-operation profiling to `hft_macro`, guarded by:
 
 ```cpp
 LLMES_PROFILE_HFT_MACRO_OPS
@@ -362,8 +330,7 @@ The profiler separates mixed macro latency into operation classes:
 - `modify_miss`
 - `market`
 
-It records count/share, mean latency, p50/p95/p99 latency, mean cycles, and
-weighted contribution to total macro time.
+It records count/share, mean latency, p50/p95/p99 latency, mean cycles, and weighted contribution to total macro time.
 
 The helper script is:
 
@@ -423,28 +390,20 @@ Market intensity:
 
 ### Current Interpretation
 
-The profiling result shows that `add_rest` and `cancel_miss` dominate weighted
-macro time in the current measured batch.
+The profiling result shows that `add_rest` and `cancel_miss` dominate weighted macro time in the current measured batch.
 
-The unexpectedly low `cancel_hit` share is itself an important finding. It
-suggests the benchmark's pre-generated operation stream or its live-order
-tracking may be drifting away from the actual book state. Before optimizing the
-engine based on this table, the benchmark accounting should be reviewed and
-made trustworthy.
+The unexpectedly low `cancel_hit` share is itself an important finding. It suggests the benchmark's pre-generated operation stream or its live-order tracking may be drifting away from the actual book state. Before optimizing the engine based on this table, the benchmark accounting should be reviewed and made trustworthy.
 
 ### Follow-up Fix and Cloud Validation
 
-A follow-up benchmark fix was implemented in `benchmark/src/hft/bench_hft_macro.cpp`
-using the same operation-mix policy (random draw with 45/48/5/2 percentages),
-but replacing predictive batch generation with a planning replay model:
+A follow-up benchmark fix was implemented in `benchmark/src/hft/bench_hft_macro.cpp` using the same operation-mix policy (random draw with 45/48/5/2 percentages), but replacing predictive batch generation with a planning replay model:
 
 - warmup still runs once
 - two books are rebuilt from the same warmup snapshot:
   - `planning_book_` (untimed, used only in `Setup()`)
   - `book_` (timed, used only in `RunOp()`)
 - each pending op is first executed on `planning_book_`
-- tracking is updated from real execution outputs (`trades`,
-  `remaining_quantity`) instead of prediction
+- tracking is updated from real execution outputs (`trades`, `remaining_quantity`) instead of prediction
 
 This removes the major source of false `cancel_miss`:
 
@@ -464,8 +423,7 @@ Local smoke validation (`TRIALS=1`, `BATCH_SIZE=20000`) shows:
 | `modify_miss` | 0.00% |
 | `market` | 1.75% |
 
-This result supports the earlier diagnosis that high `cancel_miss` was mainly a
-benchmark-accounting artifact rather than an engine behavior signal.
+This result supports the earlier diagnosis that high `cancel_miss` was mainly a benchmark-accounting artifact rather than an engine behavior signal.
 
 A later cloud validation ran the repaired profiling on `phase4-finale`:
 
@@ -509,32 +467,109 @@ Operation profile:
 
 The main findings from this repaired profile are:
 
-- `cancel_miss` and `modify_miss` are both zero, confirming that the earlier
-  miss-heavy profile was a benchmark-accounting artifact.
-- `add_rest` is the dominant measured cost center: it contributes 52.977% of
-  total weighted macro time.
-- `cancel_hit` remains important at 35.438% weighted time, but its latency is
-  already low and tight-tailed (`mean=48.459ns`, `p99=70ns`).
-- `modify_hit` is individually expensive (`mean=131.357ns`) but low-frequency,
-  contributing 8.157% weighted time.
-- `market` is not the current macro bottleneck: it contributes only 2.861%
-  weighted time, with `market_levels_p99=1` and `market_filled_qty_p99=5`.
-- The result weakens the original ChunkPool cache-locality hypothesis for macro
-  performance. The measured workload is dominated by high-frequency resting-add
-  fixed costs, not by deep sweeps or cancel traversal.
-- From an HFT engineering perspective, the most profit-sensitive path exposed
-  by this profile is `add_rest`, because it is both the largest weighted cost
-  and the quote-placement path affecting FIFO queue priority.
+- `cancel_miss` and `modify_miss` are both zero, confirming that the earlier miss-heavy profile was a benchmark-accounting artifact.
+- `add_rest` is the dominant measured cost center: it contributes 52.977% of total weighted macro time.
+- `cancel_hit` remains important at 35.438% weighted time, but its latency is already low and tight-tailed (`mean=48.459ns`, `p99=70ns`).
+- `modify_hit` is individually expensive (`mean=131.357ns`) but low-frequency, contributing 8.157% weighted time.
+- `market` is not the current macro bottleneck: it contributes only 2.861% weighted time, with `market_levels_p99=1` and `market_filled_qty_p99=5`.
+- The result weakens the original ChunkPool cache-locality hypothesis for macro performance. The measured workload is dominated by high-frequency resting-add fixed costs, not by deep sweeps or cancel traversal.
+- From an HFT engineering perspective, the most profit-sensitive path exposed by this profile is `add_rest`, because it is both the largest weighted cost and the quote-placement path affecting FIFO queue priority.
+
+## Phase 5: add_rest Stage Profiling (Created, Then Retired)
+
+### Design
+
+To move from operation-level attribution to function-level attribution inside the dominant `add_rest` path, an instrumentation feature was added behind `LLMES_PROFILE_ADD_REST_STAGES`. It wrapped each sub-stage of `add_limit_order` in a `__rdtsc()` + `steady_clock::now()` timer pair:
+
+- `validation`
+- `match`
+- `pool_acquire`
+- `node_init`
+- `level_lookup_existing` / `level_create_new`
+- `fifo_append`
+- `id_index_insert`
+
+The `get_or_create()` return type was changed to `std::pair<PriceLevel*, bool>` so the instrumentation could distinguish an existing-level lookup from a new-level creation.
+
+### Recorded Result and Conclusion
+
+A cloud run (commit `237820e`, batch 100000) reported each stage at roughly 139-150 cycles, with `level_lookup_existing` the cheapest at 63.89 cycles. This led to the (later overturned) conclusion that the `std::map` price-level container was not a binding constraint.
+
+### Why It Was Retired
+
+The production `perf record` run (next section) contradicted the stage data. The reconciliation showed the stage profiler was unreliable: the operations being timed are ~5-40 ns each, while a `__rdtsc()` + `steady_clock::now()` pair is itself tens of ns. The probe cost was comparable to or larger than the probed region, so the measurement reported mostly its own overhead and **flattened** the real spread. The evidence is internal to the stage data itself: `node_init` (a 4-field struct assignment), `fifo_append` (a 4-pointer linked-list append), and `pool_acquire` (a free-list pop) all reported ~140 cycles, which none of those operations can genuinely cost.
+
+The conclusion was that per-sub-stage timing instrumentation is not a viable profiling method for this engine. The entire feature was removed: `add_rest_stage_profile.{hpp,cpp}`, the `order_book.cpp` and `bench_hft_macro.cpp` instrumentation, the CMake options, and `run_hft_macro_add_rest_stage_profile.sh`. Operation-level profiling (`LLMES_PROFILE_HFT_MACRO_OPS`) was kept, because it times whole operations with a single timer pair and its op shares are corroborated by the perf function-level breakdown.
+
+## Phase 5: Window-Isolated `perf record` Production Profiling
+
+### Design
+
+The next profiling step was a production-mode `perf record` for instruction- and function-level attribution with no instrumentation overhead. The problem is that `bench_hft_macro`'s `Setup()` is heavy and runs on every measured iteration (~5,000 seed adds, a 500,000-event warmup replay, two book rebuilds, and full batch pre-generation). A naive `perf record ./bench_hft_macro` would be dominated by that scaffolding.
+
+The solution reuses the existing PMC enable/disable window idea via `perf record --control=fifo`. A new env-guarded helper in the runner (`benchmark_runner.cpp::PerfRecordControl`) enables sampling only around the measured `RunOp` batch; warmup, `Setup()`, and `Teardown()` run with sampling disabled. The helper is inert (zero overhead) unless the FIFO paths are provided via `LLMES_PERF_CTL_FIFO` / `LLMES_PERF_ACK_FIFO`. Driver script:
+
+```text
+benchmark/scripts/run_hft_macro_perf_record.sh
+```
+
+The profiling binary is built Release + `-g` with no `LLMES_PROFILE_*` macros, so the recorded code path is the exact production engine.
+
+### Cloud Run
+
+```text
+commit:       635f1c8
+events:       cycles, branch-misses (freq 8000, call-graph dwarf)
+orders:       100000
+levels:       100
+batch_size:   1000000
+warmup_iters: 1
+iters:        40
+window:       RunOp batch only (perf --control=fifo, -D -1)
+```
+
+Artifacts:
+
+```text
+benchmark/results/hft_macro_perf_record_cloud_20260601/
+```
+
+The run was clean: 40 paired enable/disable transitions, a clean 18.47M ops/s @ 54.1 ns/op (no instrumentation overhead), 30,354 samples. (`annotate_*.txt` came out empty because at `-O3` the engine is fully inlined into `RunOp`, so there is no standalone `add_limit_order` symbol; the call-graph report still gives full function-level attribution.)
+
+### Function-Level Findings (share of all `RunOp` samples)
+
+| Function / sub-cost | cycles % | branch-miss % |
+|---|---:|---:|
+| `add_limit_order` | 50.5% | 50.4% |
+| ┣ `get_or_create` (`std::map`) | 17.8% | 18.9% |
+| ┣ `contains` (id-index dup check) | 11.2% | 10.6% |
+| ┣ `emplace` (id-index insert) | 9.9% | 9.9% |
+| `cancel_order` | 29.8% | 29% |
+| `modify_order` | 8.0% | 8% |
+
+Two main findings:
+
+1. **`id_to_order_` (`absl::flat_hash_map`) dominates the whole macro.** Summed across operations (add 21.1%, cancel 27.6%, plus modify), roughly half of all macro cycles are spent in the cancel index. The add path probes the same key twice: `contains` (duplicate guard, always misses on `add_rest`) then `emplace` (re-hashes and re-probes). The `contains` cost (~11% of cycles) is recoverable by merging into a single `lazy_emplace` / `find_or_prepare_insert`.
+
+2. **The `std::map` level container is NOT cheap in a long run.** `get_or_create` is 35% of `add_limit_order` (17.8% of all cycles) and the single largest branch-miss source (`_Rb_tree_insert_and_rebalance` plus `lower_bound`), with `operator new` / `malloc` on level creation and `cfree` / rebalance on `erase_best`. This contradicts the stage-profiling conclusion. The contradiction is a measurement artifact (see the retired stage-profiling section), not a workload difference; the production `perf record` profile is the authoritative measurement.
+
+Full analysis is recorded in `report/phase5_macro_profiling_plan.md`.
+
+### Production-Evidence-Ranked Optimization Plan
+
+- **Tier 1 (highest leverage, lowest risk):** eliminate the `id_to_order_` double-probe in `add_limit_order`; switch `pending_cancel_ids_` to an empty-guard + `absl::flat_hash_set`. Expected ~+6-9% macro.
+- **Tier 2a (safe):** give `std::map` a pooled / free-list allocator to remove level create/destroy `operator new` / `malloc` / `cfree` churn while keeping pointer stability (`Order::parent_level`).
+- **Tier 2b (deferred, structural):** replace `std::map` with `absl::btree_map` or a hot contiguous structure; requires changing the ownership model first because value-moving containers would invalidate `Order::parent_level`.
+- **Tier 3:** leave the cancel `find` / `erase` path alone (already tight, p99 60 ns).
 
 ## Current Status
 
 As of the current repository state:
 
 - `master` is based on `phase4a`
-- per-operation HFT macro profiling has been added
-- ChunkPool benchmark artifacts are recorded but the design is not the active
-  baseline
-- repaired macro workload accounting has been cloud-validated on
-  `phase4-finale`
-- the latest profiling analysis is recorded in
-  `report/phase4_hft_macro_optimization_priority.md`
+- per-operation HFT macro profiling (`LLMES_PROFILE_HFT_MACRO_OPS`) is retained
+- the `add_rest` stage-profiling feature was added and then **removed** as a non-viable measurement method (probe overhead dwarfed the probed region)
+- a window-isolated production `perf record` path was added (`PerfRecordControl` + `benchmark/scripts/run_hft_macro_perf_record.sh`) and cloud-validated
+- ChunkPool benchmark artifacts are recorded but the design is not the active baseline
+- the production profile shows the cancel-index hash map (~50% of macro cycles, with a redundant add-path double-probe) and the `std::map` level container (~24% of cycles, top branch-miss source) as the two ranked optimization targets
+- the latest profiling analysis is recorded in `report/phase5_macro_profiling_plan.md` (and the earlier `report/phase4_hft_macro_optimization_priority.md`)
