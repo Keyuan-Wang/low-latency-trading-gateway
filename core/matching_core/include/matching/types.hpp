@@ -7,6 +7,9 @@ namespace matching {
 
 class IntrusiveList;  // forward decl — full definition in intrusive_list.hpp
 
+using OrderHandle = std::uint32_t;  // Direct index into the order pool.
+inline constexpr OrderHandle kInvalidHandle = UINT32_MAX;
+
 enum class Side {
     Buy,   ///< Bid side (buy book).
     Sell,  ///< Ask side (sell book).
@@ -38,6 +41,8 @@ struct AddResult {
     std::uint64_t initial_quantity{0};   ///< Requested quantity at entry.
     std::uint64_t filled_quantity{0};      ///< Total matched quantity.
     std::uint64_t remaining_quantity{0};   ///< Unfilled quantity after matching / rest.
+
+    OrderHandle handle{kInvalidHandle};
 
     std::vector<Trade> trades{};           ///< Individual fills, in chronological order.
 };

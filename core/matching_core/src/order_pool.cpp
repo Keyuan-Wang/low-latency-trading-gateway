@@ -1,5 +1,6 @@
 # include "matching/order_pool.hpp"
 #include "matching/types.hpp"
+#include <cassert>
 
 
 namespace matching {
@@ -11,21 +12,28 @@ OrderPool::OrderPool(std::size_t capacity) : pool_(capacity) {
     }
 }
 
-Order* OrderPool::acquire() {
-    if (!free_head_)    return nullptr;
+OrderHandle OrderPool::acquire() {
+    if (!free_head_)    return kInvalidHandle;
 
-    Order* result = free_head_;
-    free_head_ = result->next;
+    Order* o = free_head_;
+    free_head_ = o->next;
 
-    result->prev = nullptr;
-    result->next = nullptr;
+    o->prev = nullptr;
+    o->next = nullptr;
 
-    return result;
+    return static_cast<OrderHandle>(index_of(o));
 }
 
 void OrderPool::release(Order* o) {
     o->next = free_head_;
     free_head_ = o;
+}
+
+
+Order* OrderPool::resolve(OrderHandle h) noexcept {
+    assert(h != kInvalidHandle);
+    assert(static_cast<std::size_t>(h) < pool_.size());
+    return &pool_[h];
 }
 
 std::size_t OrderPool::capacity() const noexcept {

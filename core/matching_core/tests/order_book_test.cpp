@@ -23,6 +23,7 @@ int main() {
         expect(r.filled_quantity == 0, "no fill");
         expect(r.remaining_quantity == 10, "full qty rests");
         expect(r.trades.empty(), "no trade");
+        expect(r.handle != matching::kInvalidHandle, "resting order returns handle");
     }
 
     // 2. matching + push remaining orders in the book
@@ -49,25 +50,24 @@ int main() {
         expect(r.code == matching::ErrorCode::MarketRemainderCancelled, "remainder cancelled");
     }
 
-    // 4. pending cancel + duplicate / pending insert
+    // 4. handle-based cancel
     {
         matching::OrderBook b;
-        expect(b.cancel_order(42) == matching::ErrorCode::UnknownOrderId, "unknown cancel");
-        expect(b.pending_cancel_count() == 1, "pending size");
         const auto r = b.add_limit_order(42, matching::Side::Buy, 100, 1, 1);
-        expect(r.code == matching::ErrorCode::PendingCancelExists, "blocked by pending cancel");
+        expect(r.code == matching::ErrorCode::Success, "insert before cancel");
+        expect(r.handle != matching::kInvalidHandle, "cancel target handle");
+        expect(b.cancel_order(r.handle) == matching::ErrorCode::Success, "handle cancel");
     }
 
-    // 5. duplicate order id rejected
+    // 5. business order ids are not used for matching-core uniqueness checks
     {
         matching::OrderBook b;
         const auto first = b.add_limit_order(7, matching::Side::Buy, 100, 10, 1);
         expect(first.code == matching::ErrorCode::Success, "first insert ok");
 
-        const auto dup = b.add_limit_order(7, matching::Side::Sell, 101, 5, 2);
-        expect(dup.code == matching::ErrorCode::DuplicateOrderId, "duplicate rejected");
-        expect(dup.remaining_quantity == 5, "full qty returned as remaining");
-        expect(dup.trades.empty(), "no trades on duplicate");
+        const auto second = b.add_limit_order(7, matching::Side::Buy, 99, 5, 2);
+        expect(second.code == matching::ErrorCode::Success, "duplicate business id allowed");
+        expect(second.handle != first.handle, "each resting order has its own handle");
     }
 
     std::cout << "order_book tests passed\n";
