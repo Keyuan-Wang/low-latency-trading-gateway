@@ -6,8 +6,6 @@
 #include <array>
 #include <cassert>
 #include <cstddef>
-#include <limits>
-#include <memory>
 #include <utility>
 #include <bit>
 
@@ -64,6 +62,6 @@ public:
 
     void set_anchor(std::size_t idx, std::int64_t price) noexcept { best_price_anchor_ = idx; best_price_ = price; }
     void reset() noexcept { live_mask_ = 0; best_price_ = kNoPrice; }
-}
+};
 
 }   // namespace matching
