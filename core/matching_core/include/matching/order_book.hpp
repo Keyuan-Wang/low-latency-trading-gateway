@@ -14,26 +14,9 @@
 #include "types.hpp"
 #include "price_level.hpp"
 #include "order_pool.hpp"
+#include "cached_order_book.hpp"
 
 namespace matching {
-
-template <bool IsAsk>
-struct PriceCompare;
-
-template <>
-struct PriceCompare<true> {
-    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
-        return lhs < rhs;
-    }
-};
-
-template <>
-struct PriceCompare<false> {
-    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
-        return lhs > rhs;
-    }
-};
-
 /**
  * @brief Price-level container for one side of the book.
  *
@@ -139,8 +122,8 @@ public:
     ErrorCode cancel_order(OrderHandle h);
 
 private:
-    BidBook bids_{};   ///< Bid price levels (best bid at @c begin()).
-    AskBook asks_{};   ///< Ask price levels (best ask at @c begin()).
+    CachedSideBook<false> bids_;   ///< Bid price levels (best bid at @c begin()).
+    CachedSideBook<true> asks_;   ///< Ask price levels (best ask at @c begin()).
 
     OrderPool pool_;
 };

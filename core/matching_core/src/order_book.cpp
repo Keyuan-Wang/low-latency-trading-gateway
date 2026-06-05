@@ -139,9 +139,9 @@ AddResult OrderBook::add_limit_order(std::uint64_t order_id, Side side, std::int
 
     PriceLevel* level = nullptr;
     if (side == Side::Buy) {
-        level = bids_.get_or_create(price).first;
+        level = bids_.get_or_create(price);
     } else {
-        level = asks_.get_or_create(price).first;
+        level = asks_.get_or_create(price);
     }
 
     level->push_back(*node);

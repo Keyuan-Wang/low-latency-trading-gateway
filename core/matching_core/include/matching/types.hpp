@@ -10,6 +10,24 @@ class PriceLevel;  // forward decl — full definition in price_level.hpp
 using OrderHandle = std::uint32_t;  // Direct index into the order pool.
 inline constexpr OrderHandle kInvalidHandle = UINT32_MAX;
 
+template <bool IsAsk>
+struct PriceCompare;
+
+template <>
+struct PriceCompare<true> {
+    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
+        return lhs < rhs;
+    }
+};
+
+template <>
+struct PriceCompare<false> {
+    bool operator()(std::int64_t lhs, std::int64_t rhs) const noexcept {
+        return lhs > rhs;
+    }
+};
+
+
 enum class Side {
     Buy,   ///< Bid side (buy book).
     Sell,  ///< Ask side (sell book).

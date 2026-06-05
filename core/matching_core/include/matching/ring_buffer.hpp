@@ -4,64 +4,192 @@
 #include "types.hpp"
 
 #include <array>
-#include <cassert>
-#include <cstddef>
-#include <utility>
 #include <bit>
-
+#include <cassert>
+#include <climits>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <utility>
 
 namespace matching {
 
+/**
+ * @brief Fixed-size ring of the nearest @c RingSize price ticks around the best quote.
+ *
+ * @tparam IsAsk @c true for the ask side, @c false for the bid side.
+ *
+ * @details Each slot may own one @ref PriceLevel. @ref CachedSideBook drives all
+ * policy (hot vs cold, re-anchor); this class only maintains slot occupancy.
+ *
+ * A slot is live when its bit is set in @c live_mask_, @c price != @ref kNoPrice,
+ * and @c level is non-null. Cleared slots always reset @c price to @ref kNoPrice
+ * so @c slot.price == query_price in the caller is a safe hit test.
+ */
 template <bool IsAsk>
 class RingBuffer {
-    static constexpr std::size_t RingSize   = 16;
-    static constexpr std::size_t kMask      = RingSize - 1;
-    static constexpr std::uint64_t kValid   = (1ull << RingSize) - 1;
-    static constexpr std::int64_t kNoPrice  = INT64_MIN;
-
-    struct Slot { std::int64_t price;   PriceLevel* level; };    // price and level share the same cache line
-
-    std::int64_t    best_price_         = kNoPrice;         // cached best price anchor
-    std::size_t     best_price_anchor_  = 0;                // best price idx
-    std::uint64_t   live_mask_          = 0;                // bit i <=> slots_[i]
-    std::array<Slot, RingSize> slots_;
-    
 public:
-    // distance between best price and price, the smaller the better, rank < 0 means new best price
+    /** Number of price ticks kept in the ring. Must be a power of two. */
+    static constexpr std::size_t   RingSize = 16;
+
+    /** Bit mask for index wrap: @c idx & kMask == idx % RingSize. */
+    static constexpr std::size_t   kMask    = RingSize - 1;
+
+    /** Lower @c RingSize bits of @c live_mask_; ignores unused high bits. */
+    static constexpr std::uint64_t kValid   = (1ull << RingSize) - 1;
+
+    /** Marks an unused slot; no legitimate order price equals @c INT64_MIN. */
+    static constexpr std::int64_t  kNoPrice = INT64_MIN;
+
+    static_assert((RingSize & (RingSize - 1)) == 0, "RingSize must be a power of 2");
+    static_assert(RingSize <= 64, "live_mask_ is uint64_t; RingSize cannot exceed 64");
+
+private:
+    /** One ring cell: tick price plus optional owned level. */
+    struct Slot {
+        std::int64_t                price = kNoPrice;
+        std::unique_ptr<PriceLevel> level{};
+    };
+
+    /** Cached best tick; equals @c slots_[anchor_].price when non-empty. */
+    std::int64_t    best_price_  = kNoPrice;
+
+    /** Ring index of the current best (most aggressive) live slot. */
+    std::size_t     anchor_      = 0;
+
+    /** Bit @c i set iff @c slots_[i] is live. */
+    std::uint64_t   live_mask_   = 0;
+
+    std::array<Slot, RingSize> slots_;
+
+public:
+    RingBuffer()                             = default;
+    RingBuffer(const RingBuffer&)            = delete;
+    RingBuffer& operator=(const RingBuffer&) = delete;
+
+    /**
+     * @brief Tick offset from best to @p price in the side's aggression direction.
+     * @param price Query tick.
+     * @return @c 0 at best; positive for worse ticks inside/outside the window;
+     *         negative if @p price is strictly better than current best.
+     * @pre @ref empty() is false.
+     */
     [[gnu::always_inline]] std::int64_t rank(std::int64_t price) const noexcept {
-        if constexpr (IsAsk)    return price - best_price_;
-        else                    return best_price_ - price;
+        assert(best_price_ != kNoPrice && "rank() called on empty ring");
+        // Ask: lower price is better. Bid: higher price is better.
+        if constexpr (IsAsk) return price - best_price_;
+        else                 return best_price_ - price;
     }
-    // check if rank in hot ring window, for r < 0, static_cast<std::uint64_t>(r) returns very large value so returns false
-    bool in_hot_window(std::int64_t r) const noexcept { return static_cast<std::uint64_t>(r) < RingSize; }
-    // return the circular idx of rank r
-    std::size_t idx_of(std::int64_t r) const noexcept { return (best_price_anchor_ + static_cast<std::size_t>(r)) & kMask; }
 
-    // hot path
-    bool empty()                const noexcept { return live_mask_ == 0; }
-    std::int64_t best_price()   const noexcept { return best_price_; }
-    PriceLevel*  best_level()   const noexcept { return slots_[best_price_anchor_].level; }
-    Slot&        slot(std::size_t i)  noexcept { return slots_[i]; }
+    /**
+     * @brief Whether offset @p r falls inside the hot window @c [0, RingSize).
+     * @param r Output of @ref rank().
+     *
+     * Casting negative @p r to @c uint64_t makes it huge, so one comparison
+     * covers both "better than best" and "farther than window".
+     */
+    [[gnu::always_inline]] bool in_hot_window(std::int64_t r) const noexcept {
+        return static_cast<std::uint64_t>(r) < RingSize;
+    }
 
+    /**
+     * @brief Physical ring index for logical offset @p r from @c anchor_.
+     * @param r Output of @ref rank().
+     * @pre @ref empty() is false.
+     *
+     * Negative @p r wraps correctly because @c RingSize is a power of two
+     * and we mask with @ref kMask instead of using integer modulo.
+     */
+    [[gnu::always_inline]] std::size_t idx_of(std::int64_t r) const noexcept {
+        return (anchor_ + static_cast<std::size_t>(r)) & kMask;
+    }
 
-    void insert(std::size_t idx, std::int64_t price, PriceLevel* level) noexcept {
-        slots_[idx] = {price, level};   
+    /** @return @c true when no slot is live. */
+    bool empty() const noexcept { return live_mask_ == 0; }
+
+    /** @return Current best tick (undefined if empty). */
+    std::int64_t best_price() const noexcept { return best_price_; }
+
+    /** @return Non-owning pointer to the level at @c anchor_. */
+    PriceLevel* best_level() const noexcept { return slots_[anchor_].level.get(); }
+
+    /** @return Ring index of the best slot. */
+    std::size_t anchor() const noexcept { return anchor_; }
+
+    Slot&       slot(std::size_t i)       noexcept { return slots_[i]; }
+    const Slot& slot(std::size_t i) const noexcept { return slots_[i]; }
+
+    /**
+     * @brief Install a new level at ring index @p idx.
+     * @param idx Target slot (caller computes via @ref idx_of()).
+     * @param price Tick stored in the slot; must not be @ref kNoPrice.
+     * @param level Ownership transferred into the ring.
+     */
+    void insert(std::size_t idx, std::int64_t price, std::unique_ptr<PriceLevel> level) noexcept {
+        assert(price != kNoPrice);
+        assert(level != nullptr);
+        slots_[idx].price = price;
+        slots_[idx].level = std::move(level);
         live_mask_ |= (1ull << idx);
     }
 
-    PriceLevel* evict(std::size_t idx) noexcept {       // clear slot_[idx], return outdated PriceLevel* to cold map
+    /**
+     * @brief Destroy the level at @p idx and mark the slot free.
+     * @pre @c slots_[idx].level is null or already empty (no resting orders).
+     */
+    void remove(std::size_t idx) noexcept {
+        assert(
+            (slots_[idx].level == nullptr || slots_[idx].level->empty()) &&
+            "remove() called on non-empty PriceLevel — resting orders would be leaked"
+        );
+        live_mask_ &= ~(1ull << idx);
+        slots_[idx].price = kNoPrice;
+        slots_[idx].level.reset();
+    }
+
+    /**
+     * @brief Hand the level at @p idx to the caller and clear the slot.
+     * @return Owned level (caller typically moves it into the cold map).
+     */
+    [[nodiscard]] std::unique_ptr<PriceLevel> evict(std::size_t idx) noexcept {
         live_mask_ &= ~(1ull << idx);
         slots_[idx].price = kNoPrice;
         return std::exchange(slots_[idx].level, nullptr);
     }
-    // start from best_price_anchor_, find the offset of next live bit for the "warse" direction, -1 means the ring buffer is empty
+
+    /**
+     * @brief Find the next live slot toward worse prices.
+     * @return Offset from @c anchor_, or @c -1 if nothing is live.
+     *
+     * Rotates @c live_mask_ so bit @c anchor_ becomes bit 0, then uses
+     * @c countr_zero. Rotation is masked to @ref kValid — a full 64-bit
+     * @c rotr would leave stray bits above @c RingSize and corrupt the result.
+     */
     int next_live_offset() const noexcept {
-        std::uint64_t m = std::rotr(live_mask_ & kValid, best_price_anchor_) & kValid;
-        return m ? std::countr_zero(m) : -1;
+        const std::uint64_t m       = live_mask_ & kValid;
+        const std::uint64_t rotated = ((m >> anchor_) | (m << (RingSize - anchor_))) & kValid;
+        return rotated ? std::countr_zero(rotated) : -1;
     }
 
-    void set_anchor(std::size_t idx, std::int64_t price) noexcept { best_price_anchor_ = idx; best_price_ = price; }
-    void reset() noexcept { live_mask_ = 0; best_price_ = kNoPrice; }
+    /**
+     * @brief Repoint the ring origin without touching slot contents.
+     * @param idx New anchor index; slot @p idx should already match @p price.
+     * @param price New best tick written to @c best_price_.
+     */
+    void set_anchor(std::size_t idx, std::int64_t price) noexcept {
+        assert(price != kNoPrice);
+        anchor_     = idx;
+        best_price_ = price;
+    }
+
+    /**
+     * @brief Drop all live bits after slots were individually cleared.
+     * @note @c anchor_ is left stale; the next @ref set_anchor() overwrites it.
+     */
+    void reset() noexcept {
+        live_mask_  = 0;
+        best_price_ = kNoPrice;
+    }
 };
 
 }   // namespace matching
