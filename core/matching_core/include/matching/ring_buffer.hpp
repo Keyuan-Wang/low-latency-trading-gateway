@@ -14,6 +14,21 @@
 
 namespace matching {
 
+template <std::size_t N>
+struct uint_from_size;
+
+template <>
+struct uint_from_size<8> { using type = std::uint8_t; };
+
+template <>
+struct uint_from_size<16> { using type = std::uint16_t; };
+
+template <>
+struct uint_from_size<32> { using type = std::uint32_t; };
+
+template <>
+struct uint_from_size<64> { using type = std::uint64_t; };
+
 /**
  * @brief Fixed-size ring of the nearest @c RingSize price ticks around the best quote.
  *
@@ -35,9 +50,6 @@ public:
     /** Bit mask for index wrap: @c idx & kMask == idx % RingSize. */
     static constexpr std::size_t   kMask    = RingSize - 1;
 
-    /** Lower @c RingSize bits of @c live_mask_; ignores unused high bits. */
-    static constexpr std::uint64_t kValid   = (1ull << RingSize) - 1;
-
     /** Marks an unused slot; no legitimate order price equals @c INT64_MIN. */
     static constexpr std::int64_t  kNoPrice = INT64_MIN;
 
@@ -58,9 +70,10 @@ private:
     std::size_t     anchor_      = 0;
 
     /** Bit @c i set iff @c slots_[i] is live. */
-    std::uint64_t   live_mask_   = 0;
+    using MaskType = typename uint_from_size<RingSize>::type;
+    MaskType  live_mask_   = 0;
 
-    std::array<Slot, RingSize> slots_;
+    std::array<Slot, RingSize>      slots_;
 
 public:
     RingBuffer()                             = default;
@@ -130,7 +143,7 @@ public:
         assert(level != nullptr);
         slots_[idx].price = price;
         slots_[idx].level = std::move(level);
-        live_mask_ |= (1ull << idx);
+        live_mask_ |= (static_cast<MaskType>(1) << idx);
     }
 
     /**
@@ -142,7 +155,7 @@ public:
             (slots_[idx].level == nullptr || slots_[idx].level->empty()) &&
             "remove() called on non-empty PriceLevel — resting orders would be leaked"
         );
-        live_mask_ &= ~(1ull << idx);
+        live_mask_ &= ~(static_cast<MaskType>(1) << idx);
         slots_[idx].price = kNoPrice;
         slots_[idx].level.reset();
     }
@@ -152,7 +165,7 @@ public:
      * @return Owned level (caller typically moves it into the cold map).
      */
     [[nodiscard]] std::unique_ptr<PriceLevel> evict(std::size_t idx) noexcept {
-        live_mask_ &= ~(1ull << idx);
+        live_mask_ &= ~(static_cast<MaskType>(1) << idx);
         slots_[idx].price = kNoPrice;
         return std::exchange(slots_[idx].level, nullptr);
     }
@@ -166,8 +179,7 @@ public:
      * @c rotr would leave stray bits above @c RingSize and corrupt the result.
      */
     int next_live_offset() const noexcept {
-        const std::uint64_t m       = live_mask_ & kValid;
-        const std::uint64_t rotated = ((m >> anchor_) | (m << (RingSize - anchor_))) & kValid;
+        const std::uint64_t rotated = std::rotr(live_mask_, static_cast<int>(anchor_));
         return rotated ? std::countr_zero(rotated) : -1;
     }
 
