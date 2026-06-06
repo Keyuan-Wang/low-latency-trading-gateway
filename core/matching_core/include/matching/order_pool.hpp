@@ -15,7 +15,7 @@ private:
 public:
     explicit OrderPool(std::size_t capacity);
 
-    [[nodiscard]] OrderHandle acquire();  // Returns kInvalidHandle if the pool is full.
+    [[nodiscard]] [[gnu::always_inline]] OrderHandle acquire();  // Returns kInvalidHandle if the pool is full.
     void    release(Order* o);    // return a freed slot back to top of stack
     [[nodiscard]] Order* resolve(OrderHandle h) noexcept;
 

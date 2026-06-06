@@ -16,7 +16,7 @@ PriceLevelPool::PriceLevelPool(std::size_t capacity) {
     }
 }
 
-[[nodiscard]] PriceLevel* PriceLevelPool::acquire() {
+[[nodiscard]] [[gnu::always_inline]] PriceLevel* PriceLevelPool::acquire() {
     assert(free_head_ != nullptr && "PriceLevelPool exhausted");
 
     Slot* slot = free_head_;
