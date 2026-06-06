@@ -307,17 +307,48 @@ With allocation no longer dominant, the remaining `add_limit_order` cost is spre
 3. **`push_back` 5% + `OrderPool::acquire` 2%** — fixed cost of landing a resting order.
 4. **`AddResult::~AddResult` / `vector<Trade>` dtor 1.92%** — every `add_limit_order` returns an `AddResult` carrying a `std::vector<Trade>`; its construct/destruct sits on the hot path. A Phase 8 candidate (caller-supplied trade buffer or small-vector to avoid per-call heap).
 
+## Experiment 7: Phase 7c Short-Function Inlining
+
+The Phase 7b perf profile still showed small but repeated pool/handle helpers as visible symbols on the hot path. In particular, `OrderPool::acquire()`, `OrderPool::release()`, `OrderPool::resolve()`, `PriceLevelPool::acquire()`, and `PriceLevelPool::release()` are only a few pointer operations each, but they occur on very high-frequency add/cancel/modify paths. Some had not been inlined under the prior split header/source layout.
+
+Phase 7c moves these short function bodies into headers and marks the hot helpers with `[[gnu::always_inline]]`. The final branch also marks other tiny ring/price-level helpers, but the expected and observed main win is from the pool acquire/release/resolve helpers that prior perf reports explicitly showed as non-inlined call sites.
+
+10-trial cloud comparison:
+
+```text
+server_results/compare_master_vs_phase7b_20260606_184425/
+```
+
+Configuration: `hft_macro`, `orders=100000`, `levels=100`, `batch_size=100000`, `iters=1`, `warmup_iters=1`, `seed=42`.
+
+| Version | Meaning | avg ns/op | ops/s | instr/op | cycles/op |
+|---|---|---:|---:|---:|---:|
+| `phase7b` @ `79031d5` | PriceLevelPool baseline | 21.36 | 46.8M | 153.8 | 77.7 |
+| `master` @ `397e80a` | header-only pools + short-function `always_inline` | 19.33 | 51.7M | 137.1 | 71.6 |
+
+Result:
+
+- latency improved by about **9.5%** vs Phase 7b (`21.36 -> 19.33 ns/op`)
+- throughput improved by about **10.5%** (`46.8M -> 51.7M ops/s`)
+- instructions/op dropped by about **10.9%** (`153.8 -> 137.1`)
+- cycles/op dropped by about **7.9%** (`77.7 -> 71.6`)
+
+This is a surprisingly large gain for an inlining-only change, but it matches the profile evidence: the functions being forced inline are exactly the high-frequency, low-body-cost helpers where call/return overhead and missed optimization across the call boundary are disproportionate. It is not evidence that arbitrary `always_inline` should be sprayed broadly; it worked here because the profile had already identified these helpers as visible hot-path calls.
+
+Build note: the first remote attempt on `0d0422f` failed because the pool `.cpp` files had been removed but were still listed in CMake. `397e80a` fixed the CMake target list and produced the successful result above.
+
 ## Phase 7 Summary
 
-Phase 7 took `hft_macro` from the Phase 6a baseline of **30.3 ns/op** to **21.2 ns/op** (−30% latency, +43% throughput) in two steps:
+Phase 7 took `hft_macro` from the Phase 6a baseline of **30.3 ns/op** to **19.3 ns/op** (−36% latency, +57% throughput) in three steps:
 
 - **Phase 7a** — hot ring buffer + cold `std::map` (levels via `new`/`delete`): 30.3 → 23.2 ns/op. The ring structure itself delivered the bulk of the gain by replacing `std::map`'s RB-tree traversal with O(1) array indexing.
 - **Phase 7b** — `PriceLevelPool` removes hot-path `new`/`delete`: 23.2 → 21.2 ns/op (a further 8.7%).
+- **Phase 7c** — header-only/`always_inline` short helpers, mainly pool acquire/release and handle resolve: 21.4 → 19.3 ns/op (a further 9.5%).
 
 RingSize=16 was confirmed optimal for this workload (Experiment 3).
 
 ### Remaining cost centers (Phase 8 candidates)
 
-After the pool removed hot-path allocation (Experiment 6), the largest remaining `add_limit_order` blocks are `match_against` (~10%), `reanchor_to` (~4.8%), and the `AddResult`/`vector<Trade>` construct-destruct (~1.9%).
+The latest structural benchmark baseline is Phase 7c (`397e80a`). The latest production perf profile is still Phase 7b (`e8c4f29`), so its pool acquire/release/resolve percentages are partially superseded by Experiment 7. A fresh Phase 7c `perf record` should be the first Phase 8 step before choosing the next target. From the Phase 7b profile, the likely remaining candidates are `match_against` (~10%), `reanchor_to` (~4.8%), `push_back` (~5%), and the `AddResult`/`vector<Trade>` construct-destruct (~1.9%).
 
 *(Cross-phase progression is tracked in `PROJECT_HISTORY.md`.)*

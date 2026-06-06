@@ -21,6 +21,7 @@ The notes below are based on:
 - `server_results/compare_master_vs_phase6a_20260603_173405/`
 - `server_results/compare_master_vs_phase6a_20260605_182321/`
 - `server_results/master_ring_size_sweep_trials30_20260605_185129/`
+- `server_results/compare_master_vs_phase7b_20260606_184425/`
 
 ## Phase 1: Correctness-First Baseline
 
@@ -678,8 +679,9 @@ Headline `hft_macro` at `orders=100000`, `levels=100`, 10 trials (devalidated un
 | phase6a / master snapshot | 29.3 | 34.1M |
 | Phase 7a (ring + cold map) | 23.2 | 43.1M |
 | Phase 7b (+ PriceLevelPool) | 21.2 | 47.3M |
+| Phase 7c (+ short-function inline) | 19.3 | 51.7M |
 
-Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking. Phase 6 uses handle-aware benchmark scope (handles resolved in `Setup()`). Phase 7 adds the hot ring / cold map price-level storage on top of the handle-based core, then a dedicated price-level pool. See the Phase 7 section below for the full progression table.
+Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking. Phase 6 uses handle-aware benchmark scope (handles resolved in `Setup()`). Phase 7 adds the hot ring / cold map price-level storage on top of the handle-based core, then a dedicated price-level pool, then header-only forced inlining for the small pool/handle helpers. See the Phase 7 section below for the full progression table.
 
 ## Phase 6b Candidate: PMR Price-Level Node Pool (Rejected)
 
@@ -785,6 +787,7 @@ When the best price advances toward worse prices, `erase_best()` promotes cold e
 | `fc971b9` | `live_mask_` type trait and bit-manipulation cleanup |
 | `1096ad5` | Phase 7 benchmark report |
 | `e8c4f29` | `PriceLevelPool`: remove hot-path `new`/`delete` (Phase 7b) |
+| `397e80a` | Header-only pools + `always_inline` short hot helpers (Phase 7c) |
 
 ### Benchmark Result: Phase 7 vs Phase 6a
 
@@ -847,9 +850,45 @@ Pool is about 8.7% faster, 95% CIs do not overlap. Unlike the rejected PMR exper
 
 A fresh window-isolated `perf record` (`server_results/hft_macro_perf_record_master_20260606_161810/`, commit `e8c4f29`) confirms the allocator block is gone: `get_or_create` fell from ~12.3% to ~9.5% of RunOp cycles and hot-path `malloc` disappeared (`PriceLevelPool::acquire` is 1.71%). The newly dominant `add_limit_order` cost centers are `match_against` (~10%), `reanchor_to` (~4.8%), and `AddResult`/`vector<Trade>` construct-destruct (~1.9%) — candidate targets for Phase 8.
 
+### Phase 7c: Header-Only Short Helpers and Forced Inlining
+
+After Phase 7b, perf still showed several tiny helpers as visible hot-path calls. These functions do very little work individually, but they occur on extremely high-frequency paths:
+
+- `OrderPool::acquire()`
+- `OrderPool::release()`
+- `OrderPool::resolve()`
+- `PriceLevelPool::acquire()`
+- `PriceLevelPool::release()`
+
+Phase 7c moved the hot short function bodies into headers and marked them with `[[gnu::always_inline]]`. The final patch also applied the attribute to other small ring/price-level helpers, but the main expected source of gain was the pool acquire/release and handle resolve functions that prior perf reports had explicitly shown were not consistently inlined.
+
+Cloud comparison:
+
+```text
+server_results/compare_master_vs_phase7b_20260606_184425/
+```
+
+Configuration: `hft_macro`, `orders=100000`, `levels=100`, `batch_size=100000`, 10 trials.
+
+| Version | Meaning | avg ns/op | ops/s | instr/op | cycles/op |
+|---|---|---:|---:|---:|---:|
+| `phase7b` @ `79031d5` | PriceLevelPool baseline | 21.36 | 46.8M | 153.8 | 77.7 |
+| `master` @ `397e80a` | header-only pools + short-function `always_inline` | 19.33 | 51.7M | 137.1 | 71.6 |
+
+Result:
+
+- latency improved by about 9.5% (`21.36 -> 19.33 ns/op`)
+- throughput improved by about 10.5% (`46.8M -> 51.7M ops/s`)
+- instructions/op dropped by about 10.9% (`153.8 -> 137.1`)
+- cycles/op dropped by about 7.9% (`77.7 -> 71.6`)
+
+This is a large result for an inlining-only change, but it is consistent with the profile evidence: high-frequency helpers with tiny bodies are exactly where function-call overhead and missed cross-call optimization are expensive relative to useful work. The result should not be interpreted as a general endorsement of blanket `always_inline`; it worked here because the profile had already identified these helpers as visible hot-path call sites.
+
+Build note: the first remote attempt at `0d0422f` failed because the pool `.cpp` files had been removed but were still listed in CMake. Commit `397e80a` removed those stale CMake entries and produced the successful run.
+
 ### Current Interpretation
 
-Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-based identity was not allocator pooling of the ordered map, but removing ordered-map work from the near-best price-level path (Phase 7a), followed by direct level pooling (Phase 7b).
+Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-based identity was not allocator pooling of the ordered map, but removing ordered-map work from the near-best price-level path (Phase 7a), followed by direct level pooling (Phase 7b), and then eliminating missed inlining on tiny high-frequency pool/handle helpers (Phase 7c).
 
 ### Cross-Phase headline `hft_macro` progression
 
@@ -864,7 +903,8 @@ Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-b
 | Phase 6a | 30.3 | 33.0M | handle-based cancel, no in-core id hash |
 | Phase 7a | 23.2 | 43.1M | hot ring buffer + cold map |
 | Phase 7b | 21.2 | 47.3M | + PriceLevelPool |
+| Phase 7c | 19.3 | 51.7M | + header-only/always_inline short helpers |
 
-Phase 1 → Phase 7b: roughly `2170 -> 21.2 ns/op`, about a 102x throughput improvement on the headline macro workload. Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking.
+Phase 1 → Phase 7c: roughly `2170 -> 19.3 ns/op`, about a 112x throughput improvement on the headline macro workload. Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking.
 
-The next step should be a fresh production profile after any Phase 8 change. The Phase 7b profile above is the current authoritative baseline; the older Phase 6a profile is superseded because its `std::map get_or_create` bottleneck has been structurally replaced.
+The next step should be a fresh production profile on Phase 7c before choosing a Phase 8 target. The Phase 7b profile remains useful for broad shape, but its pool acquire/release/resolve costs are partially superseded by Phase 7c. The older Phase 6a profile is superseded because its `std::map get_or_create` bottleneck has been structurally replaced.
