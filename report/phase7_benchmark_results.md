@@ -232,21 +232,92 @@ add_limit_order total ~57%
 
 Phase 7 compresses the old ~28% `std::map` `get_or_create` block to ~12%, but **`reanchor_to` + hot-ring `materialize`** absorb much of the savings. Matching-side `erase_best` / `empty` still totals ~15% of RunOp cycles.
 
-## Cross-Phase Summary
+## Experiment 5: PriceLevelPool vs new/delete (Phase 7b vs Phase 7a)
 
-Headline `hft_macro` latency across all measured phases, from the unified campaign and Phase 7 results:
+10 trials. master/Phase 7b @ `e8c4f29` (`PriceLevelPool`, no hot-path `new`/`delete`) vs phase7a @ `da9be8c` (hot ring + cold map with `make_unique<PriceLevel>`).
 
-| Phase | avg ns/op | ops/s | Key change |
-|---|---:|---:|---|
-| Phase 1 | 2170 | 0.47M | `std::list`, O(N) cancel |
-| Phase 2a | 2137 | 0.47M | pool-backed intrusive list |
-| Phase 2b | 48.3 | 20.7M | `unordered_map` O(1) cancel index |
-| Phase 2e | 39.8 | 25.2M | `absl::flat_hash_map` (Swiss Table) |
-| Phase 4a | 39.3 | 25.5M | `SideBook` abstraction |
-| Phase 5 | 34.4 | 29.1M | production profiling baseline |
-| Phase 6a | 30.3 | 33.0M | handle-based cancel, hash map removed |
-| **Phase 7** | **24.2** | **41.3M** | **hot ring buffer + cold std::map** |
+| Metric | master (pool) | phase7a (make_unique) | Change |
+|---|---:|---:|---:|
+| avg ns/op | **21.16** | 23.18 | **−8.7%** |
+| ops/s | **47.3M** | 43.1M | **+9.5%** |
+| instructions/op | **153.8** | 177.5 | **−13.4%** |
+| cycles/op | **77.9** | 84.4 | **−7.7%** |
+| branches/op | **30.65** | 36.05 | **−15.0%** |
+| branch misses/op | 1.488 | 1.488 | 0% |
+| cache misses/op | **0.0334** | 0.0414 | **−19.3%** |
+| CPI | 0.507 | 0.475 | +6.6% |
 
-Phase 1 → Phase 7 cumulative: **2170 → 24.2 ns/op, 90× throughput improvement**.
+95% CIs do not overlap: master [21.08, 21.24] vs phase7a [22.98, 23.38].
 
-Phase 6a → Phase 7: **30.3 → 24.2 ns/op, 20% latency reduction, 25% throughput gain**.
+Artifacts: `server_results/compare_master_vs_phase7a_20260606_171238/`
+
+### A clean win, unlike the rejected PMR experiment
+
+The PMR node-pool experiment (Phase 6b candidate, rejected) reduced cache misses but **raised** instruction count ~19%, netting a regression. `PriceLevelPool` is the opposite: it reduces **both** instructions (−13.4%) **and** cache misses (−19.3%) at the same time. The difference:
+
+- **PMR** wrapped `std::map`'s RB-tree node allocator in an abstraction layer whose own metadata bookkeeping and control flow added instructions.
+- **PriceLevelPool** directly replaces `make_unique<PriceLevel>` (one `malloc`/`free` per level). A free-list `acquire`/`release` is a few pointer ops, far cheaper than `operator new`'s size-class lookup and bucket management. The pool's contiguous PriceLevel storage also improves locality vs heap-scattered objects, so cache misses drop too.
+
+### Reading the CPI correctly
+
+CPI rose 6.6% (0.475 → 0.507) — this is a denominator artifact, not a regression. After cutting 13% of instructions, the "expensive" remaining instructions (pool indirection, residual cache misses) form a larger fraction, pulling average CPI up. But latency = instructions × CPI, and the instruction drop dominates: **absolute cycles/op still fell 7.7%**. cycles/op is the honest metric here; CPI alone is misleading. Branch misses/op are unchanged (1.488 vs 1.488), as expected — the pool changes allocation, not control flow.
+
+## Experiment 6: Production `perf record` after PriceLevelPool (RingSize=16)
+
+Window-isolated RunOp profiling on `master` @ `e8c4f29` (RingSize=16, `PriceLevelPool`). Same methodology as Experiment 4: Release + `-g`, `cycles,branch-misses` @ 8000 Hz, `perf --control=fifo -D -1`, `batch_size=1_000_000`, `iters=40`. Samples: 15,149 cycles events, 0 lost. Wall latency this run: avg **31.1 ns/op** over the 1M batch (not comparable to the 100k campaign numbers).
+
+Artifacts: `server_results/hft_macro_perf_record_master_20260606_161810/`
+
+### Top-level `execute_pending` breakdown
+
+| Operation | % RunOp cycles |
+|---|---:|
+| `add_limit_order` | **55.1** (direct 47.4 + nested in `modify_order` ~8) |
+| `cancel_order` | 10.6 |
+| `modify_order` | 9.3 |
+| `add_market_order` | 2.2 |
+
+### `add_limit_order` hot spots (self %)
+
+| Hot spot | % RunOp |
+|---|---:|
+| `get_or_create` (ask 4.93 + bid 4.54) | ~9.5 |
+| `match_against` (both `operator()` lambdas) | ~10 |
+| `erase_best` (both sides) | ~5.3 |
+| `push_back` (FIFO enqueue) | 5.0 |
+| `reanchor_to` (ask 1.79 + bid 3.02) | ~4.8 |
+| `OrderPool::acquire` | 2.0 |
+| `PriceLevelPool::acquire` | **1.71** |
+| `AddResult::~AddResult` / `vector<Trade>` dtor | 1.92 |
+
+### Pool eliminated the allocator block
+
+Compared to the Phase 7a perf profile (`get_or_create` ~12.3% with ~5.8% hot-path `malloc`):
+
+- `get_or_create` dropped to ~9.5%.
+- The hot-path `malloc` is gone; `PriceLevelPool::acquire` is only 1.71%.
+- This ~3% reclaimed directly explains the 13% instruction-count reduction in Experiment 5.
+
+### New cost centers exposed
+
+With allocation no longer dominant, the remaining `add_limit_order` cost is spread across:
+
+1. **`match_against` ~10%** — the matching loop itself (walk opposite best level, generate trades, `emplace_back` into `out.trades`).
+2. **`reanchor_to` ~4.8%** — a meaningful share, indicating best-price improvements are frequent in this workload; each triggers a window slide and possible eviction. This was not visible in earlier profiles.
+3. **`push_back` 5% + `OrderPool::acquire` 2%** — fixed cost of landing a resting order.
+4. **`AddResult::~AddResult` / `vector<Trade>` dtor 1.92%** — every `add_limit_order` returns an `AddResult` carrying a `std::vector<Trade>`; its construct/destruct sits on the hot path. A Phase 8 candidate (caller-supplied trade buffer or small-vector to avoid per-call heap).
+
+## Phase 7 Summary
+
+Phase 7 took `hft_macro` from the Phase 6a baseline of **30.3 ns/op** to **21.2 ns/op** (−30% latency, +43% throughput) in two steps:
+
+- **Phase 7a** — hot ring buffer + cold `std::map` (levels via `new`/`delete`): 30.3 → 23.2 ns/op. The ring structure itself delivered the bulk of the gain by replacing `std::map`'s RB-tree traversal with O(1) array indexing.
+- **Phase 7b** — `PriceLevelPool` removes hot-path `new`/`delete`: 23.2 → 21.2 ns/op (a further 8.7%).
+
+RingSize=16 was confirmed optimal for this workload (Experiment 3).
+
+### Remaining cost centers (Phase 8 candidates)
+
+After the pool removed hot-path allocation (Experiment 6), the largest remaining `add_limit_order` blocks are `match_against` (~10%), `reanchor_to` (~4.8%), and the `AddResult`/`vector<Trade>` construct-destruct (~1.9%).
+
+*(Cross-phase progression is tracked in `PROJECT_HISTORY.md`.)*

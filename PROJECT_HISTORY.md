@@ -676,9 +676,10 @@ Headline `hft_macro` at `orders=100000`, `levels=100`, 10 trials (devalidated un
 | p4fin-deval | 40.2 | 24.9M |
 | phase5-deval | 34.4 | 29.1M |
 | phase6a / master snapshot | 29.3 | 34.1M |
-| master (Phase 7) | 24.2 | 41.3M |
+| Phase 7a (ring + cold map) | 23.2 | 43.1M |
+| Phase 7b (+ PriceLevelPool) | 21.2 | 47.3M |
 
-Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking. Phase 6 uses handle-aware benchmark scope (handles resolved in `Setup()`). Phase 7 adds the hot ring / cold map price-level storage on top of the handle-based core.
+Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking. Phase 6 uses handle-aware benchmark scope (handles resolved in `Setup()`). Phase 7 adds the hot ring / cold map price-level storage on top of the handle-based core, then a dedicated price-level pool. See the Phase 7 section below for the full progression table.
 
 ## Phase 6b Candidate: PMR Price-Level Node Pool (Rejected)
 
@@ -753,7 +754,8 @@ Each side book is now:
 ```text
 CachedSideBook<IsAsk>
 ├── RingBuffer<IsAsk> hot_
-└── std::map<price, std::unique_ptr<PriceLevel>, PriceCompare<IsAsk>> cold_
+├── std::map<price, PriceLevel*, PriceCompare<IsAsk>> cold_
+└── PriceLevelPool pool_      (Phase 7b; Phase 7a used new/delete per level)
 ```
 
 Important implementation choices:
@@ -763,7 +765,7 @@ Important implementation choices:
 - `RingSize` is currently 16. The physical slot index is `(anchor + rank) & (RingSize - 1)`.
 - `RingBuffer` tracks live slots with `live_mask_`, and the mask type is selected at compile time through `uint_from_size<RingSize>` (`uint16_t` for the current configuration).
 - `next_live_offset()` uses `std::rotr` plus `std::countr_zero` to find the next live price level after the best is drained.
-- `PriceLevel` ownership is stored in `std::unique_ptr`; moving a level between hot and cold does not move the pointee, so `Order::parent_level` remains valid.
+- `PriceLevel` objects are pointer-stable: moving a level between hot and cold only moves the pointer, never the pointee, so `Order::parent_level` remains valid. Phase 7a held levels via `std::unique_ptr` (one `new`/`delete` per level, matching the `std::map` baseline for a fair comparison); Phase 7b replaced that with `PriceLevelPool`, a free-list pool that removes all hot-path `new`/`delete`.
 
 The current implementation keeps a strict invariant:
 
@@ -779,9 +781,10 @@ When the best price advances toward worse prices, `erase_best()` promotes cold e
 |---|---|
 | `f283b3d` | First ring-buffer implementation |
 | `c8adf9b` | First `CachedSideBook` WIP integration |
-| `bc70159` | Finished hot ring buffer + cold map design |
+| `bc70159` | Finished hot ring buffer + cold map design (Phase 7a) |
 | `fc971b9` | `live_mask_` type trait and bit-manipulation cleanup |
 | `1096ad5` | Phase 7 benchmark report |
+| `e8c4f29` | `PriceLevelPool`: remove hot-path `new`/`delete` (Phase 7b) |
 
 ### Benchmark Result: Phase 7 vs Phase 6a
 
@@ -829,17 +832,39 @@ Conclusion:
 - `RingSize=64` shows a weak regression trend, likely due to extra instruction/codegen cost rather than cache footprint.
 - `RingSize=16` is the current choice because it matches 32's performance with half the ring footprint.
 
+### Phase 7b: PriceLevelPool
+
+Phase 7a left one allocator cost on the hot path: each new price level was a `make_unique<PriceLevel>` (one `malloc`, freed on level removal). Phase 7b replaces this with `PriceLevelPool`, a free-list pool of pre-allocated `PriceLevel` objects. `acquire()`/`release()` are a few pointer operations; cold-map values become raw `PriceLevel*` owned by the pool.
+
+Cloud run (`server_results/compare_master_vs_phase7a_20260606_171238/`), `hft_macro`, `orders=100000`, `levels=100`, 10 trials:
+
+| Version | Meaning | avg ns/op | ops/s | instr/op | cache miss/op |
+|---|---|---:|---:|---:|---:|
+| `phase7a` @ `da9be8c` | hot ring + cold map, `make_unique` | 23.18 | 43.1M | 177.5 | 0.041 |
+| `master` @ `e8c4f29` | + `PriceLevelPool` | 21.16 | 47.3M | 153.8 | 0.033 |
+
+Pool is about 8.7% faster, 95% CIs do not overlap. Unlike the rejected PMR experiment, this is a clean win on **both** axes: instructions dropped 13.4% **and** cache misses dropped 19.3%. PMR added an allocator-abstraction layer that raised instruction count; the pool's free-list and contiguous storage reduce both. (CPI rose 6.6% as a denominator artifact — fewer total instructions leave the expensive ones a larger fraction — but absolute cycles/op still fell 7.7%.)
+
+A fresh window-isolated `perf record` (`server_results/hft_macro_perf_record_master_20260606_161810/`, commit `e8c4f29`) confirms the allocator block is gone: `get_or_create` fell from ~12.3% to ~9.5% of RunOp cycles and hot-path `malloc` disappeared (`PriceLevelPool::acquire` is 1.71%). The newly dominant `add_limit_order` cost centers are `match_against` (~10%), `reanchor_to` (~4.8%), and `AddResult`/`vector<Trade>` construct-destruct (~1.9%) — candidate targets for Phase 8.
+
 ### Current Interpretation
 
-Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-based identity was not allocator pooling, but removing ordered-map work from the near-best price-level path.
+Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-based identity was not allocator pooling of the ordered map, but removing ordered-map work from the near-best price-level path (Phase 7a), followed by direct level pooling (Phase 7b).
 
-Current headline `hft_macro` result:
+### Cross-Phase headline `hft_macro` progression
 
 | Phase | avg ns/op | ops/s | Key change |
 |---|---:|---:|---|
+| Phase 1 | 2170 | 0.47M | `std::list`, O(N) cancel |
+| Phase 2a | 2137 | 0.47M | pool-backed intrusive list |
+| Phase 2b | 48.3 | 20.7M | `unordered_map` O(1) cancel index |
+| Phase 2e | 39.8 | 25.2M | `absl::flat_hash_map` (Swiss Table) |
+| Phase 4a | 39.3 | 25.5M | `SideBook` abstraction |
+| Phase 5 | 34.4 | 29.1M | production profiling baseline |
 | Phase 6a | 30.3 | 33.0M | handle-based cancel, no in-core id hash |
-| Phase 7 | 24.2 | 41.3M | hot ring buffer + cold map |
+| Phase 7a | 23.2 | 43.1M | hot ring buffer + cold map |
+| Phase 7b | 21.2 | 47.3M | + PriceLevelPool |
 
-From Phase 1 to Phase 7, the project records roughly `2170ns/op -> 24.2ns/op`, about a 90x throughput improvement on the headline macro workload.
+Phase 1 → Phase 7b: roughly `2170 -> 21.2 ns/op`, about a 102x throughput improvement on the headline macro workload. Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking.
 
-The next step should be a fresh Phase 7 production profile before choosing another optimization target. The prior Phase 6a profile is no longer authoritative because the `std::map get_or_create` bottleneck it identified has now been structurally replaced.
+The next step should be a fresh production profile after any Phase 8 change. The Phase 7b profile above is the current authoritative baseline; the older Phase 6a profile is superseded because its `std::map get_or_create` bottleneck has been structurally replaced.
