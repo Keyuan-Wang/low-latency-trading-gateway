@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 
+#include "matching/pricelevel_pool.hpp"
 #include "price_level.hpp"
 #include "ring_buffer.hpp"
 #include "types.hpp"
@@ -22,6 +23,14 @@ namespace matching {
  *
  * @c cold_ only holds prices strictly outside the current hot window, so a tick
  * cannot exist in both tiers. An empty ring implies an empty cold map.
+ *
+ * @par Ownership
+ * Each side owns a @ref PriceLevelPool. Ring slots and cold-map values are
+ * non-owning @c PriceLevel* into that pool. Only this class calls
+ * @c pool_.acquire() / @c pool_.release(). Three structural invariants
+ * (hot–cold ordering, cold outside window, live-bit ↔ slot consistency) ensure
+ * pool slots are never leaked or double-freed; see
+ * @c report/phase7_hot_ring_cold_map_design.md.
  */
 template <bool IsAsk>
 class CachedSideBook {
@@ -49,10 +58,12 @@ public:
     void erase_best();
 
 private:
-    using ColdMap = std::map<std::int64_t, std::unique_ptr<PriceLevel>, PriceCompare<IsAsk>>;
+    using ColdMap = std::map<std::int64_t, PriceLevel*, PriceCompare<IsAsk>>;
 
-    RingBuffer<IsAsk> hot_;   ///< Near-best window.
-    ColdMap           cold_;  ///< Far ticks; @c begin() is the most aggressive cold price.
+    RingBuffer<IsAsk> hot_;   ///< Near-best window (non-owning @c PriceLevel* per slot).
+    ColdMap           cold_;  ///< Far ticks; values are non-owning pooled levels.
+
+    PriceLevelPool pool_{100000};  ///< Freelist; sole acquire/release authority for this side.
 
     /**
      * @brief Whether cold tick @p p now lies inside the hot window.
@@ -63,24 +74,25 @@ private:
     }
 
     /**
-     * @brief Allocate a fresh level and install it at hot slot @p idx.
-     * @return Raw pointer valid until the slot is removed or evicted.
+     * @brief Acquire a pooled level and install it at vacant hot slot @p idx.
+     * @pre @c hot_.slot(idx) is vacant (Invariant 3).
+     * @return Pooled pointer stored in the ring until remove/evict + release.
      */
     PriceLevel* materialize(std::size_t idx, std::int64_t price) noexcept {
-        auto l = std::make_unique<PriceLevel>();
-        PriceLevel* raw = l.get();
-        hot_.insert(idx, price, std::move(l));
-        return raw;
+        auto l = pool_.acquire();
+        hot_.insert(idx, price, l);
+        return l;
     }
 
     /**
      * @brief Look up or insert @p price in @c cold_.
      * @pre @ref rank(price) >= RingSize (caller guarantees out-of-window).
+     * @note On insert, acquires one pool object; key is fresh by Invariant 2.
      */
     PriceLevel* cold_get_or_create(std::int64_t price) noexcept {
         auto [it, inserted] = cold_.try_emplace(price);
-        if (inserted) it->second = std::make_unique<PriceLevel>();
-        return it->second.get();
+        if (inserted) it->second = pool_.acquire();
+        return it->second;
     }
 
     /**
@@ -96,7 +108,7 @@ private:
         assert(hot_.slot(idx).price == RingBuffer<IsAsk>::kNoPrice &&
                "promote_cold(): target hot slot is already occupied");
 
-        hot_.insert(idx, p, std::move(it->second));
+        hot_.insert(idx, p, it->second);
         cold_.erase(it);
     }
 
@@ -125,8 +137,10 @@ PriceLevel* CachedSideBook<IsAsk>::get_or_create(std::int64_t price) {
     if (hot_.in_hot_window(r)) [[likely]] {
         std::size_t idx  = hot_.idx_of(r);
         auto&       s    = hot_.slot(idx);
-        if (s.price == price) return s.level.get();  // exact tick hit
-        return materialize(idx, price);              // slot reserved but different tick
+        if (s.price == price) return s.level;  // exact tick hit
+
+        assert(!hot_.slot(idx).level);       // Invariant 3: vacant slot only
+        return materialize(idx, price);
     }
 
     // Strictly better than best: re-center the ring on the new tick.
@@ -142,6 +156,7 @@ void CachedSideBook<IsAsk>::erase_best() {
     assert(hot_.best_level() != nullptr && hot_.best_level()->empty() &&
            "erase_best() called before the best level was fully drained");
 
+    pool_.release(hot_.slot(hot_.anchor()).level);
     hot_.remove(hot_.anchor());
 
     // Walk toward worse prices until we find a non-empty level or exhaust hot.
@@ -157,7 +172,7 @@ void CachedSideBook<IsAsk>::erase_best() {
             auto it        = cold_.begin();
             std::int64_t p = it->first;
             hot_.set_anchor(0, p);
-            hot_.insert(0, p, std::move(it->second));
+            hot_.insert(0, p, it->second);
             cold_.erase(it);
             break;
         }
@@ -169,6 +184,7 @@ void CachedSideBook<IsAsk>::erase_best() {
         if (!hot_.slot(idx).level->empty()) break;
 
         // Ghost slot: level emptied by cancels before erase_best reached it.
+        pool_.release(hot_.slot(idx).level);
         hot_.remove(idx);
     }
 
@@ -205,6 +221,7 @@ PriceLevel* CachedSideBook<IsAsk>::reanchor_to(std::int64_t price) noexcept {
 
         if (hot_.slot(i).level) {
             if (hot_.slot(i).level->empty()) {
+                pool_.release(hot_.slot(i).level);
                 hot_.remove(i);
             } else {
                 // Resting orders remain: park the level in cold at its old tick.
@@ -225,6 +242,7 @@ void CachedSideBook<IsAsk>::flush_all_to_cold() noexcept {
 
         std::int64_t p = hot_.slot(i).price;
         if (hot_.slot(i).level->empty()) {
+            pool_.release(hot_.slot(i).level);
             hot_.remove(i);
         } else {
             cold_.emplace(p, hot_.evict(i));

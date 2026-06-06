@@ -34,8 +34,9 @@ struct uint_from_size<64> { using type = std::uint64_t; };
  *
  * @tparam IsAsk @c true for the ask side, @c false for the bid side.
  *
- * @details Each slot may own one @ref PriceLevel. @ref CachedSideBook drives all
- * policy (hot vs cold, re-anchor); this class only maintains slot occupancy.
+ * @details Each slot may reference one pooled @ref PriceLevel (non-owning pointer).
+ * @ref CachedSideBook owns pool acquire/release; this class only maintains slot
+ * occupancy and pointer wiring.
  *
  * A slot is live when its bit is set in @c live_mask_, @c price != @ref kNoPrice,
  * and @c level is non-null. Cleared slots always reset @c price to @ref kNoPrice
@@ -57,10 +58,10 @@ public:
     static_assert(RingSize <= 64, "live_mask_ is uint64_t; RingSize cannot exceed 64");
 
 private:
-    /** One ring cell: tick price plus optional owned level. */
+    /** One ring cell: tick price plus optional non-owning level pointer. */
     struct Slot {
-        std::int64_t                price = kNoPrice;
-        std::unique_ptr<PriceLevel> level{};
+        std::int64_t  price = kNoPrice;
+        PriceLevel*   level{};
     };
 
     /** Cached best tick; equals @c slots_[anchor_].price when non-empty. */
@@ -124,7 +125,7 @@ public:
     std::int64_t best_price() const noexcept { return best_price_; }
 
     /** @return Non-owning pointer to the level at @c anchor_. */
-    PriceLevel* best_level() const noexcept { return slots_[anchor_].level.get(); }
+    PriceLevel* best_level() const noexcept { return slots_[anchor_].level; }
 
     /** @return Ring index of the best slot. */
     std::size_t anchor() const noexcept { return anchor_; }
@@ -136,18 +137,19 @@ public:
      * @brief Install a new level at ring index @p idx.
      * @param idx Target slot (caller computes via @ref idx_of()).
      * @param price Tick stored in the slot; must not be @ref kNoPrice.
-     * @param level Ownership transferred into the ring.
+     * @param level Non-owning pooled level; must be non-null.
+     * @pre @c slots_[idx] is vacant (@ref Invariant 3 in phase7 design doc).
      */
-    void insert(std::size_t idx, std::int64_t price, std::unique_ptr<PriceLevel> level) noexcept {
+    void insert(std::size_t idx, std::int64_t price, PriceLevel* level) noexcept {
         assert(price != kNoPrice);
         assert(level != nullptr);
         slots_[idx].price = price;
-        slots_[idx].level = std::move(level);
+        slots_[idx].level = level;
         live_mask_ |= (static_cast<MaskType>(1) << idx);
     }
 
     /**
-     * @brief Destroy the level at @p idx and mark the slot free.
+     * @brief Clear the slot; does not return the level to @ref PriceLevelPool.
      * @pre @c slots_[idx].level is null or already empty (no resting orders).
      */
     void remove(std::size_t idx) noexcept {
@@ -157,14 +159,14 @@ public:
         );
         live_mask_ &= ~(static_cast<MaskType>(1) << idx);
         slots_[idx].price = kNoPrice;
-        slots_[idx].level.reset();
+        slots_[idx].level = nullptr;
     }
 
     /**
-     * @brief Hand the level at @p idx to the caller and clear the slot.
-     * @return Owned level (caller typically moves it into the cold map).
+     * @brief Detach the level pointer at @p idx and clear the slot.
+     * @return Non-owning pooled level (caller typically stores it in the cold map).
      */
-    [[nodiscard]] std::unique_ptr<PriceLevel> evict(std::size_t idx) noexcept {
+    [[nodiscard]] PriceLevel* evict(std::size_t idx) noexcept {
         live_mask_ &= ~(static_cast<MaskType>(1) << idx);
         slots_[idx].price = kNoPrice;
         return std::exchange(slots_[idx].level, nullptr);

@@ -56,6 +56,7 @@ echo "  Ring sizes: ${SIZES[*]}"
 echo "  Server    : ${SSH_USER}@${SERVER_IP}"
 echo ""
 
+SSH_KEY="${SSH_KEY/#\~/$HOME}"
 SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new)
 
 mkdir -p "$LOCAL_OUT_DIR"

@@ -64,6 +64,13 @@ public:
         --size_;
     }
 
+    /** @brief Clear FIFO links after @ref PriceLevelPool::release (level must be empty). */
+    void reset() {
+        head_ = nullptr;
+        tail_ = nullptr;
+        size_ = 0;
+    }
+
     [[nodiscard]] bool empty() const { return head_ == nullptr; }
 
     [[nodiscard]] Order& front() const { return *head_; }

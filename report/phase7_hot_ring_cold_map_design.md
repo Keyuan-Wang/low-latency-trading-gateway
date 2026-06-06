@@ -10,17 +10,19 @@ Phase 7 replaces `std::map` on the near-best hot path with an O(1) ring-buffer i
 
 ```
 CachedSideBook<IsAsk>
-├── RingBuffer<IsAsk> hot_     16-slot circular array covering [best, best±15]
-└── std::map<price, unique_ptr<PriceLevel>, PriceCompare<IsAsk>> cold_
+├── RingBuffer<IsAsk> hot_              16-slot circular array covering [best, best±15]
+├── std::map<price, PriceLevel*, …> cold_   out-of-window ticks (non-owning pointers)
+└── PriceLevelPool pool_                freelist of reusable PriceLevel objects
 ```
 
 `CachedSideBook` exposes the same interface as the original `SideBook`: `empty()`, `best_price()`, `best_level()`, `get_or_create(price)`, `erase_best()`. The matching logic in `OrderBook` requires no changes.
 
 ### Ownership Model
 
-- Each `PriceLevel` is held by a `std::unique_ptr` and exists in exactly one location at any time: either a ring slot or a cold map node.
-- Migration (evict / promote) uses `std::move` to transfer ownership. The pointee address never changes, so `Order::parent_level` remains valid across migrations.
-- Per-level heap allocation frequency (one `new` on creation, one `delete` on destruction) matches the `std::map<price, PriceLevel>` baseline, ensuring a fair benchmark comparison. Allocator optimization is deferred to Phase 8.
+- Each live `PriceLevel` is a **stable object** from the side-local `PriceLevelPool`. At any time it is referenced from exactly one place: a ring slot (`hot_.slots_[i].level`) or a cold map node (`cold_[price]`). `RingBuffer` and `ColdMap` hold **non-owning** `PriceLevel*`; only `CachedSideBook` calls `pool_.acquire()` / `pool_.release()`.
+- Migration (evict / promote) **reassigns pointers** between ring and map. The pointee address never changes, so `Order::parent_level` remains valid across migrations.
+- `acquire()` hands out `&(slot.level)` from a preallocated freelist; `release()` requires an empty level, calls `PriceLevel::reset()`, and returns the slot to the freelist. No per-create `new` / per-destroy `delete` on the hot path — the Phase 7 perf win vs the old `make_unique<PriceLevel>` baseline comes partly from eliminating that allocator traffic.
+- Pool slot lifetime is governed by the three invariants below: a level is released only when `erase_best`, `reanchor_to`, or `flush_all_to_cold` removes an empty slot, or when a vacant hot slot is first materialized (Invariant 3 guarantees `materialize` never overwrites a live level). `cold_.emplace` after eviction always sees a fresh key (Invariant 2), so no pointer is dropped on duplicate insert.
 
 ## RingBuffer
 
@@ -28,8 +30,8 @@ CachedSideBook<IsAsk>
 
 ```cpp
 struct Slot {
-    int64_t                price;   // kNoPrice when slot is vacant
-    unique_ptr<PriceLevel> level;   // nullptr when slot is vacant
+    int64_t      price;        // kNoPrice when slot is vacant
+    PriceLevel*  level{};      // nullptr when slot is vacant; non-owning
 };
 
 int64_t   best_price_;     // cached best price
@@ -54,9 +56,9 @@ array<Slot, 16> slots_;
 
 | Operation | Semantics | State updated |
 |---|---|---|
-| `insert(idx, price, level)` | Install a new level at slot | write price + move level + set live bit |
-| `remove(idx)` | Destroy an empty level in place | set price to kNoPrice + reset level + clear live bit |
-| `evict(idx)` | Transfer level ownership to caller | set price to kNoPrice + exchange level to nullptr + clear live bit |
+| `insert(idx, price, level)` | Install a pooled level at slot | write price + store `level` pointer + set live bit |
+| `remove(idx)` | Clear an empty slot in place | set price to kNoPrice + null level pointer + clear live bit (does **not** `pool_.release`) |
+| `evict(idx)` | Detach level pointer for caller | set price to kNoPrice + exchange level to nullptr + clear live bit |
 
 All three operations use `static_cast<MaskType>(1) << idx` for bit manipulation, ensuring the shift width matches `live_mask_` exactly and avoids implicit widening/truncation.
 
@@ -184,13 +186,15 @@ The remaining **N−d non-wrap-around slots** need no processing. Their stored p
 
 The new best occupies the k=d position. That slot is evicted first (if live), then materialized with the new level.
 
-Ghost-empty levels (drained by cancels but still live in the ring) are `remove`d directly during eviction — they do not enter cold.
+Ghost-empty levels (drained by cancels but still live in the ring) are `remove`d and `pool_.release`d during eviction — they do not enter cold.
+
+Non-empty evicted levels are stored with `cold_.emplace(price, hot_.evict(i))`. Invariant 2 guarantees the key is not already present, so the emplace always succeeds and no pooled pointer is lost.
 
 ### Cancel Path — Zero Additional Overhead
 
-`cancel_order` does not touch `CachedSideBook`. It locates the level via `Order::parent_level`, calls `PriceLevel::erase`, and releases the pool slot.
+`cancel_order` does not touch `CachedSideBook` or `PriceLevelPool`. It locates the level via `Order::parent_level`, calls `PriceLevel::erase`, and releases the **order** pool slot only.
 
-A cancel may drain a level to empty without cleaning up the ring slot (creating a "ghost-empty" level). This is safe:
+A cancel may drain a price level to empty without returning the **price-level** pool slot or clearing the ring/map entry (creating a "ghost-empty" level). The `PriceLevel*` remains in its ring slot or cold map node until `erase_best` or `reanchor_to` calls `pool_.release`. This is safe:
 
 - The matching loop detects the ghost via `best_level().empty()` and calls `erase_best()` to clean up.
 - A ghost's price is at least as aggressive as the true next best. If the ghost price does not satisfy the crossing condition, the true next best certainly does not either — `break` is correct. If the ghost price does satisfy crossing, the inner loop finds the level empty, falls through to `erase_best()`, which cleans up the ghost and continues matching.
