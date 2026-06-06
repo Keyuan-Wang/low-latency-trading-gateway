@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cassert>
 #include <cstddef>
 #include <vector>
 
@@ -15,7 +16,7 @@ private:
 public:
     explicit OrderPool(std::size_t capacity);
 
-    [[nodiscard]] [[gnu::always_inline]] inline OrderHandle acquire() {  // Returns kInvalidHandle if the pool is full.
+    [[nodiscard]] [[gnu::always_inline]] OrderHandle acquire() noexcept {  // Returns kInvalidHandle if the pool is full.
         if (!free_head_) return kInvalidHandle;
 
         Order* o = free_head_;
@@ -26,8 +27,16 @@ public:
 
         return static_cast<OrderHandle>(index_of(o));
     }
-    void    release(Order* o);    // return a freed slot back to top of stack
-    [[nodiscard]] Order* resolve(OrderHandle h) noexcept;
+    [[gnu::always_inline]] void    release(Order* o) noexcept {    // return a freed slot back to top of stack
+        o->next = free_head_;
+        free_head_ = o;
+    }
+    
+    [[nodiscard]] [[gnu::always_inline]] Order* resolve(OrderHandle h) noexcept {
+        assert(h != kInvalidHandle);
+        assert(static_cast<std::size_t>(h) < pool_.size());
+        return &pool_[h];
+    }
 
     [[nodiscard]] std::size_t capacity() const noexcept;
 

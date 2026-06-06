@@ -119,19 +119,19 @@ public:
     }
 
     /** @return @c true when no slot is live. */
-    bool empty() const noexcept { return live_mask_ == 0; }
+    [[gnu::always_inline]] bool empty() const noexcept { return live_mask_ == 0; }
 
     /** @return Current best tick (undefined if empty). */
-    std::int64_t best_price() const noexcept { return best_price_; }
+    [[gnu::always_inline]] std::int64_t best_price() const noexcept { return best_price_; }
 
     /** @return Non-owning pointer to the level at @c anchor_. */
-    PriceLevel* best_level() const noexcept { return slots_[anchor_].level; }
+    [[gnu::always_inline]] PriceLevel* best_level() const noexcept { return slots_[anchor_].level; }
 
     /** @return Ring index of the best slot. */
-    std::size_t anchor() const noexcept { return anchor_; }
+    [[gnu::always_inline]] std::size_t anchor() const noexcept { return anchor_; }
 
-    Slot&       slot(std::size_t i)       noexcept { return slots_[i]; }
-    const Slot& slot(std::size_t i) const noexcept { return slots_[i]; }
+    [[gnu::always_inline]] Slot&       slot(std::size_t i)       noexcept { return slots_[i]; }
+    [[gnu::always_inline]] const Slot& slot(std::size_t i) const noexcept { return slots_[i]; }
 
     /**
      * @brief Install a new level at ring index @p idx.

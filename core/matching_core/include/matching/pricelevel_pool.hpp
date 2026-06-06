@@ -29,7 +29,7 @@ public:
     explicit PriceLevelPool(std::size_t capacity);
 
     /** @return Pointer to a reset-ready level, or asserts if the pool is exhausted. */
-    [[nodiscard]] [[gnu::always_inline]] inline PriceLevel* acquire() {
+    [[nodiscard]] [[gnu::always_inline]] inline PriceLevel* acquire() noexcept {
         assert(free_head_ != nullptr && "PriceLevelPool exhausted");
 
         Slot* slot = free_head_;
@@ -42,7 +42,17 @@ public:
      * @brief Return an empty level to the freelist.
      * @pre @p level came from this pool and @p level->empty().
      */
-    void release(PriceLevel* level);
+    [[gnu::always_inline]] void release(PriceLevel* level) noexcept {
+        assert(level != nullptr && level->empty());
+
+        level->reset();
+
+        // level points at Slot::level (first member); recover the Slot header.
+        auto* slot = reinterpret_cast<Slot*>(level);
+
+        slot->next = free_head_;
+        free_head_ = slot;
+    }
 
     [[nodiscard]] std::size_t capacity() const noexcept { return pool_.size(); }
 
