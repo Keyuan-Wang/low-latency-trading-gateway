@@ -506,7 +506,7 @@ A cloud run (commit `237820e`, batch 100000) reported each stage at roughly 139-
 
 The production `perf record` run (next section) contradicted the stage data. The reconciliation showed the stage profiler was unreliable: the operations being timed are ~5-40 ns each, while a `__rdtsc()` + `steady_clock::now()` pair is itself tens of ns. The probe cost was comparable to or larger than the probed region, so the measurement reported mostly its own overhead and **flattened** the real spread. The evidence is internal to the stage data itself: `node_init` (a 4-field struct assignment), `fifo_append` (a 4-pointer linked-list append), and `pool_acquire` (a free-list pop) all reported ~140 cycles, which none of those operations can genuinely cost.
 
-The conclusion was that per-sub-stage timing instrumentation is not a viable profiling method for this engine. The entire feature was removed: `add_rest_stage_profile.{hpp,cpp}`, the `order_book.cpp` and `bench_hft_macro.cpp` instrumentation, the CMake options, and `run_hft_macro_add_rest_stage_profile.sh`. Operation-level profiling (`LLMES_PROFILE_HFT_MACRO_OPS`) was kept, because it times whole operations with a single timer pair and its op shares are corroborated by the perf function-level breakdown.
+The conclusion was that per-sub-stage timing instrumentation is not a viable profiling method for this engine. The entire feature was removed: `add_rest_stage_profile.{hpp,cpp}`, the `order_book.cpp` and `bench_hft_macro.cpp` instrumentation, the CMake options, and `run_hft_macro_add_rest_stage_profile.sh`. The operation-level profiling path (`LLMES_PROFILE_HFT_MACRO_OPS` / `LLMES_PROFILE_HFT_MACRO_OP_PMCS`) was later removed as well, because even whole-operation inline timing/PMC attribution still changes the measured hot path and is superseded by window-isolated production `perf record`.
 
 ## Phase 5: Window-Isolated `perf record` Production Profiling
 
@@ -644,7 +644,7 @@ As of the current repository state:
 - matching core: **no** `id_to_order_`; cancel/modify are handle-based; gateway owns id validation and id→handle mapping off the hot path
 - price-level storage on `master`: `CachedSideBook` with a 16-slot hot ring buffer plus cold `std::map`
 - `RingSize=16` is the current chosen configuration after a 30-trial sweep of 8/16/32/64
-- per-operation HFT macro profiling (`LLMES_PROFILE_HFT_MACRO_OPS`) is retained
+- intrusive per-operation HFT macro profiling (`LLMES_PROFILE_HFT_MACRO_OPS` / `LLMES_PROFILE_HFT_MACRO_OP_PMCS`) has been removed from benchmark code and scripts
 - the `add_rest` stage-profiling feature was added and then **removed** as a non-viable measurement method (probe overhead dwarfed the probed region)
 - window-isolated production `perf record` validated on post-handle `master` — see `server_results/hft_macro_perf_record_master_20260603_153306/`
 - ChunkPool benchmark artifacts are recorded but the design is not the active baseline

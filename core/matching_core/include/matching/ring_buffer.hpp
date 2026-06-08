@@ -9,7 +9,6 @@
 #include <climits>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <utility>
 
 namespace matching {

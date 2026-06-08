@@ -2,7 +2,6 @@
 
 #include <cassert>
 #include <map>
-#include <memory>
 
 #include "matching/pricelevel_pool.hpp"
 #include "price_level.hpp"
