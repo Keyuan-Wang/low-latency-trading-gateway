@@ -21,29 +21,11 @@
 #include "bench_common.hpp"
 
 #include <algorithm>
-#include <array>
-#include <chrono>
 #include <cstdint>
-#include <cstdlib>
 #include <unordered_map>
-#include <fstream>
-#include <iostream>
 #include <iterator>
 #include <memory>
-#include <string>
 #include <vector>
-
-#ifndef LLMES_PROFILE_HFT_MACRO_OPS
-#define LLMES_PROFILE_HFT_MACRO_OPS 0
-#endif
-
-#ifndef LLMES_PROFILE_HFT_MACRO_OP_PMCS
-#define LLMES_PROFILE_HFT_MACRO_OP_PMCS 0
-#endif
-
-#if LLMES_PROFILE_HFT_MACRO_OPS && (defined(__x86_64__) || defined(__i386__))
-#include <x86intrin.h>
-#endif
 
 namespace {
 
@@ -68,26 +50,10 @@ struct PendingOp {
 
     // kMarket
     std::uint64_t market_qty = 0;
-    std::uint64_t market_levels_touched = 0;
-    std::uint64_t market_filled_qty = 0;
-
-    // Precomputed during setup for operation-profile reporting.
-    bool add_rests = false;
 
     // All
     std::uint64_t oid = 0;
 };
-
-#if LLMES_PROFILE_HFT_MACRO_OPS
-template <typename T>
-double QuantileNearestRank(std::vector<T> values, double q) {
-    if (values.empty()) return 0.0;
-    const std::size_t idx = static_cast<std::size_t>(
-        q * static_cast<double>(values.size() - 1));
-    std::nth_element(values.begin(), values.begin() + idx, values.end());
-    return static_cast<double>(values[idx]);
-}
-#endif
 
 // ------------------------------------------------------------------
 class BenchHftMacro final : public benchmark_runner::IBenchScenario {
@@ -110,13 +76,6 @@ public:
         id_counter_ = 1'000'000ULL;
         best_bid_ = 999;
         best_ask_ = 1000;
-
-#if LLMES_PROFILE_HFT_MACRO_OPS
-        current_iter_is_measured_ = (iter_idx >= args.warmup_iters);
-        if (iter_idx == 0) {
-            ResetProfileState(args);
-        }
-#endif
 
         // --- Warmup (untimed, uses the old generate-execute-track loop) ---
         resting_orders_.clear();
@@ -155,60 +114,14 @@ public:
 
     bool RunOp(const benchmark_runner::Args& args, std::uint64_t iter_idx,
                std::uint64_t batch_idx, std::uint64_t& ok) override {
-#if LLMES_PROFILE_HFT_MACRO_OPS
-        if (op_pmc_failed_) return false;
-        if (iter_idx >= args.warmup_iters) {
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-            if (op_pmc_enabled_ && !op_perf_.ResetEnable()) {
-                std::cerr << "failed to enable hft_macro op PMC group\n";
-                return false;
-            }
-#endif
-            const std::uint64_t c0 = ReadCycles();
-            const auto t0 = Clock::now();
-            const ExecuteOutcome outcome = execute_pending(batch_idx, ok);
-            const auto t1 = Clock::now();
-            const std::uint64_t c1 = ReadCycles();
-
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-            if (op_pmc_enabled_) {
-                if (!op_perf_.Disable()) {
-                    std::cerr << "failed to disable hft_macro op PMC group\n";
-                    return false;
-                }
-                if (!op_perf_.ReadValues(op_pmc_values_)) {
-                    std::cerr << "failed to read hft_macro op PMC group\n";
-                    return false;
-                }
-            }
-#endif
-
-            const auto dt_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                t1 - t0).count();
-            const std::uint64_t cycles = (c1 >= c0) ? (c1 - c0) : 0ULL;
-            RecordProfileSample(outcome, static_cast<double>(dt_ns), cycles
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-                                , op_pmc_enabled_ ? &op_pmc_values_ : nullptr
-#endif
-            );
-            return true;
-        }
-#endif
-        (void)execute_pending(batch_idx, ok);
+        (void)args;
+        (void)iter_idx;
+        execute_pending(batch_idx, ok);
         return true;
     }
 
     void Teardown() override {
         book_.reset();
-#if LLMES_PROFILE_HFT_MACRO_OPS
-        if (current_iter_is_measured_) {
-            ++measured_iters_done_;
-            if (!profile_emitted_ && measured_iters_done_ >= profile_args_.iters) {
-                EmitProfile();
-                profile_emitted_ = true;
-            }
-        }
-#endif
     }
 
 private:
@@ -222,42 +135,6 @@ private:
         matching::OrderHandle handle = matching::kInvalidHandle;
         std::uint64_t qty = 0;
     };
-
-    enum class OpBucket : std::uint8_t {
-        kAddRest = 0,
-        kAddCross,
-        kCancelHit,
-        kCancelMiss,
-        kModifyHit,
-        kModifyMiss,
-        kMarket,
-        kCount
-    };
-
-    struct ExecuteOutcome {
-        OpBucket bucket = OpBucket::kMarket;
-        std::uint64_t market_levels_touched = 0;
-        std::uint64_t market_filled_qty = 0;
-    };
-
-#if LLMES_PROFILE_HFT_MACRO_OPS
-    using Clock = std::chrono::steady_clock;
-
-    struct OpProfile {
-        const char* name = "";
-        std::uint64_t count = 0;
-        long double total_ns = 0.0L;
-        std::uint64_t total_cycles = 0;
-        std::vector<double> ns_samples;
-        std::uint64_t market_levels_sum = 0;
-        std::uint64_t market_filled_sum = 0;
-        std::vector<std::uint64_t> market_levels_samples;
-        std::vector<std::uint64_t> market_filled_samples;
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-        std::vector<std::uint64_t> total_pmc;
-#endif
-    };
-#endif
 
     // ================================================================
     //  State
@@ -286,24 +163,6 @@ private:
     std::vector<PendingOp> pending_;
     // Overflow queue: cluster cancels that didn't fit in pending_ spill here
     std::vector<PendingOp> pregen_queue_;
-
-#if LLMES_PROFILE_HFT_MACRO_OPS
-    std::array<OpProfile, static_cast<std::size_t>(OpBucket::kCount)> op_profile_{};
-    benchmark_runner::Args profile_args_{};
-    std::uint64_t measured_iters_done_ = 0;
-    bool current_iter_is_measured_ = false;
-    bool profile_emitted_ = false;
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-    benchmark_runner::PerfGroup op_perf_{};
-    std::string op_pmc_group_name_{};
-    std::vector<benchmark_runner::PerfEventSpec> op_pmc_specs_{};
-    std::vector<std::uint64_t> op_pmc_values_{};
-    bool op_pmc_enabled_ = false;
-    bool op_pmc_failed_ = false;
-#else
-    bool op_pmc_failed_ = false;
-#endif
-#endif
 
     // ================================================================
     //  Warmup event generation and execution (legacy path, untimed)
@@ -372,7 +231,6 @@ private:
         if (res.code == matching::ErrorCode::Success && res.remaining_quantity > 0) {
             track_add_predicted(op.oid, op.side, op.price, res.remaining_quantity);
             book_handles_[op.oid] = HandleMeta{res.handle, res.remaining_quantity};
-            op.add_rests = true;
         }
 
         pending_.push_back(op);
@@ -493,8 +351,6 @@ private:
         auto const res =
             book_->add_market_order(op.oid, op.side, op.market_qty, op.oid);
         apply_trade_fills(res.trades, &book_handles_);
-        op.market_filled_qty = res.filled_quantity;
-        op.market_levels_touched = CountTouchedLevels(res.trades);
         pending_.push_back(op);
     }
 
@@ -502,33 +358,24 @@ private:
     //  Timed execution -- RunOp calls this, pure OrderBook operation only
     // ================================================================
 
-    ExecuteOutcome execute_pending(std::size_t idx, std::uint64_t& ok) {
-        ExecuteOutcome outcome{};
-
+    void execute_pending(std::size_t idx, std::uint64_t& ok) {
         auto const& op = pending_[idx];
         switch (op.type) {
         case PendingOp::kLimitAdd: {
             auto const res =
                 book_->add_limit_order(op.oid, op.side, op.price, op.qty, op.oid);
             if (res.code == matching::ErrorCode::Success) ++ok;
-            outcome.bucket = op.add_rests ? OpBucket::kAddRest : OpBucket::kAddCross;
             break;
         }
         case PendingOp::kCancel: {
             auto const code = book_->cancel_order(op.target_handle);
-            if (code == matching::ErrorCode::Success) {
-                ++ok;
-                outcome.bucket = OpBucket::kCancelHit;
-            } else {
-                outcome.bucket = OpBucket::kCancelMiss;
-            }
+            if (code == matching::ErrorCode::Success) ++ok;
             break;
         }
         case PendingOp::kModify: {
             auto const res = book_->modify_order(op.target_handle, op.side, op.price,
                                                  op.qty, op.oid);
             if (res.code == matching::ErrorCode::Success) ++ok;
-            outcome.bucket = OpBucket::kModifyHit;
             break;
         }
         case PendingOp::kMarket: {
@@ -537,417 +384,10 @@ private:
             if (res.code == matching::ErrorCode::Success ||
                 res.code == matching::ErrorCode::MarketRemainderCancelled)
                 ++ok;
-
-            outcome.bucket = OpBucket::kMarket;
-            outcome.market_filled_qty = op.market_filled_qty;
-            outcome.market_levels_touched = op.market_levels_touched;
             break;
         }
         }
-
-        return outcome;
     }
-
-    static std::uint64_t CountTouchedLevels(
-        const std::vector<matching::Trade>& trades) noexcept {
-        if (trades.empty()) return 0;
-
-        std::uint64_t levels = 0;
-        std::int64_t last_price = 0;
-        bool has_last = false;
-        for (const auto& trade : trades) {
-            if (!has_last || trade.price != last_price) {
-                ++levels;
-                last_price = trade.price;
-                has_last = true;
-            }
-        }
-        return levels;
-    }
-
-#if LLMES_PROFILE_HFT_MACRO_OPS
-    static std::uint64_t ReadCycles() noexcept {
-#if defined(__x86_64__) || defined(__i386__)
-        return __rdtsc();
-#else
-        return 0;
-#endif
-    }
-
-    void ResetProfileState(const benchmark_runner::Args& args) {
-        profile_args_ = args;
-        measured_iters_done_ = 0;
-        profile_emitted_ = false;
-
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-        op_pmc_group_name_.clear();
-        op_pmc_specs_.clear();
-        op_pmc_values_.clear();
-        op_pmc_enabled_ = false;
-        op_pmc_failed_ = false;
-
-        if (const char* group = std::getenv("LLMES_HFT_MACRO_OP_PMC_GROUP");
-            group != nullptr && group[0] != '\0') {
-            op_pmc_group_name_ = group;
-            op_pmc_specs_ = benchmark_runner::HftMacroPerfGroupSpec(op_pmc_group_name_);
-            if (op_pmc_specs_.empty()) {
-                std::cerr << "unknown hft_macro op PMC group: "
-                          << op_pmc_group_name_ << "\n";
-                op_pmc_failed_ = true;
-            } else if (!op_perf_.Open(op_pmc_specs_)) {
-                std::cerr << "failed to open hft_macro op PMC group: "
-                          << op_pmc_group_name_ << "\n";
-                op_pmc_failed_ = true;
-            } else {
-                op_pmc_enabled_ = true;
-                op_pmc_values_.assign(op_pmc_specs_.size(), 0);
-            }
-        }
-#endif
-
-        static constexpr std::array<const char*, static_cast<std::size_t>(OpBucket::kCount)>
-            kNames = {
-                "add_rest",
-                "add_cross",
-                "cancel_hit",
-                "cancel_miss",
-                "modify_hit",
-                "modify_miss",
-                "market"
-            };
-
-        const std::size_t samples = static_cast<std::size_t>(args.batch_size * args.iters);
-        const std::size_t reserve_total = std::max<std::size_t>(samples, 64);
-        const std::array<std::size_t, static_cast<std::size_t>(OpBucket::kCount)> weights = {
-            30, 15, 40, 8, 4, 1, 2
-        };
-
-        for (std::size_t i = 0; i < op_profile_.size(); ++i) {
-            auto& p = op_profile_[i];
-            p.name = kNames[i];
-            p.count = 0;
-            p.total_ns = 0.0L;
-            p.total_cycles = 0;
-            p.market_levels_sum = 0;
-            p.market_filled_sum = 0;
-            p.ns_samples.clear();
-            p.market_levels_samples.clear();
-            p.market_filled_samples.clear();
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-            p.total_pmc.assign(op_pmc_specs_.size(), 0);
-#endif
-
-            const std::size_t reserve =
-                std::max<std::size_t>(32, (reserve_total * weights[i]) / 100);
-            p.ns_samples.reserve(reserve);
-            if (i == static_cast<std::size_t>(OpBucket::kMarket)) {
-                p.market_levels_samples.reserve(reserve);
-                p.market_filled_samples.reserve(reserve);
-            }
-        }
-    }
-
-    void RecordProfileSample(const ExecuteOutcome& outcome, double ns,
-                             std::uint64_t cycles
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-                             , const std::vector<std::uint64_t>* pmc_values
-#endif
-                             ) {
-        auto& p = op_profile_[static_cast<std::size_t>(outcome.bucket)];
-        ++p.count;
-        p.total_ns += ns;
-        p.total_cycles += cycles;
-        p.ns_samples.push_back(ns);
-
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-        if (pmc_values != nullptr && pmc_values->size() == p.total_pmc.size()) {
-            for (std::size_t i = 0; i < pmc_values->size(); ++i) {
-                p.total_pmc[i] += (*pmc_values)[i];
-            }
-        }
-#endif
-
-        if (outcome.bucket == OpBucket::kMarket) {
-            p.market_levels_sum += outcome.market_levels_touched;
-            p.market_filled_sum += outcome.market_filled_qty;
-            p.market_levels_samples.push_back(outcome.market_levels_touched);
-            p.market_filled_samples.push_back(outcome.market_filled_qty);
-        }
-    }
-
-    void EmitProfile() const {
-        std::uint64_t total_ops = 0;
-        long double total_ns = 0.0L;
-        long double total_cycles = 0.0L;
-        for (const auto& p : op_profile_) {
-            total_ops += p.count;
-            total_ns += p.total_ns;
-            total_cycles += static_cast<long double>(p.total_cycles);
-        }
-
-        if (total_ops == 0) return;
-
-        const char* out_path = std::getenv("LLMES_HFT_MACRO_OP_PROFILE_OUT");
-        const bool write_csv = (out_path != nullptr && out_path[0] != '\0');
-        if (write_csv) {
-            benchmark_runner::EnsureCsvHeader(
-                out_path,
-                "scenario,version_tag,commit_sha,trial_id,seed,orders,levels,batch_size,"
-                "warmup_iters,iters,op_type,count,share,mean_ns,p50_ns,p95_ns,p99_ns,"
-                "mean_cycles,weighted_ns_per_event,weighted_cycles_per_event,"
-                "weighted_ns_share,weighted_cycles_share,market_levels_mean,"
-                "market_levels_p95,market_levels_p99,market_filled_qty_mean,"
-                "market_filled_qty_p95,market_filled_qty_p99");
-        }
-
-        std::cout << "macro_op_profile"
-                  << " scenario=" << Name()
-                  << " version_tag=" << profile_args_.version_tag
-                  << " commit_sha=" << profile_args_.commit_sha
-                  << " trial_id=" << profile_args_.trial_id
-                  << " seed=" << profile_args_.seed
-                  << " orders=" << profile_args_.orders
-                  << " levels=" << profile_args_.levels
-                  << " batch_size=" << profile_args_.batch_size
-                  << " warmup_iters=" << profile_args_.warmup_iters
-                  << " iters=" << profile_args_.iters
-                  << " total_ops=" << total_ops
-                  << "\n";
-
-        for (const auto& p : op_profile_) {
-            const double share = static_cast<double>(p.count) /
-                                 static_cast<double>(total_ops);
-            const double mean_ns = (p.count > 0)
-                                       ? static_cast<double>(p.total_ns /
-                                            static_cast<long double>(p.count))
-                                       : 0.0;
-            const double p50_ns = benchmark_runner::Percentile(p.ns_samples, 0.50);
-            const double p95_ns = benchmark_runner::Percentile(p.ns_samples, 0.95);
-            const double p99_ns = benchmark_runner::Percentile(p.ns_samples, 0.99);
-            const double mean_cycles = (p.count > 0)
-                                           ? static_cast<double>(p.total_cycles) /
-                                                 static_cast<double>(p.count)
-                                           : 0.0;
-
-            const double weighted_ns_per_event = share * mean_ns;
-            const double weighted_cycles_per_event = share * mean_cycles;
-            const double weighted_ns_share =
-                (total_ns > 0.0L)
-                    ? static_cast<double>(p.total_ns / total_ns)
-                    : 0.0;
-            const double weighted_cycles_share =
-                (total_cycles > 0.0L)
-                    ? static_cast<double>(
-                        static_cast<long double>(p.total_cycles) / total_cycles)
-                    : 0.0;
-
-            double market_levels_mean = 0.0;
-            double market_levels_p95 = 0.0;
-            double market_levels_p99 = 0.0;
-            double market_filled_mean = 0.0;
-            double market_filled_p95 = 0.0;
-            double market_filled_p99 = 0.0;
-            if (std::string(p.name) == "market" && p.count > 0) {
-                market_levels_mean = static_cast<double>(p.market_levels_sum) /
-                                     static_cast<double>(p.count);
-                market_levels_p95 =
-                    QuantileNearestRank(p.market_levels_samples, 0.95);
-                market_levels_p99 =
-                    QuantileNearestRank(p.market_levels_samples, 0.99);
-                market_filled_mean = static_cast<double>(p.market_filled_sum) /
-                                     static_cast<double>(p.count);
-                market_filled_p95 =
-                    QuantileNearestRank(p.market_filled_samples, 0.95);
-                market_filled_p99 =
-                    QuantileNearestRank(p.market_filled_samples, 0.99);
-            }
-
-            std::cout << "macro_op_profile"
-                      << " op_type=" << p.name
-                      << " count=" << p.count
-                      << " share=" << share
-                      << " mean_ns=" << mean_ns
-                      << " p50_ns=" << p50_ns
-                      << " p95_ns=" << p95_ns
-                      << " p99_ns=" << p99_ns
-                      << " mean_cycles=" << mean_cycles
-                      << " weighted_ns_per_event=" << weighted_ns_per_event
-                      << " weighted_cycles_per_event=" << weighted_cycles_per_event
-                      << " weighted_ns_share=" << weighted_ns_share
-                      << " weighted_cycles_share=" << weighted_cycles_share
-                      << " market_levels_mean=" << market_levels_mean
-                      << " market_levels_p95=" << market_levels_p95
-                      << " market_levels_p99=" << market_levels_p99
-                      << " market_filled_qty_mean=" << market_filled_mean
-                      << " market_filled_qty_p95=" << market_filled_p95
-                      << " market_filled_qty_p99=" << market_filled_p99
-                      << "\n";
-
-            if (write_csv) {
-                std::ofstream f(out_path, std::ios::app);
-                f << Name()
-                  << ","
-                  << profile_args_.version_tag
-                  << ","
-                  << profile_args_.commit_sha
-                  << ","
-                  << profile_args_.trial_id
-                  << ","
-                  << profile_args_.seed
-                  << ","
-                  << profile_args_.orders
-                  << ","
-                  << profile_args_.levels
-                  << ","
-                  << profile_args_.batch_size
-                  << ","
-                  << profile_args_.warmup_iters
-                  << ","
-                  << profile_args_.iters
-                  << ","
-                  << p.name
-                  << ","
-                  << p.count
-                  << ","
-                  << share
-                  << ","
-                  << mean_ns
-                  << ","
-                  << p50_ns
-                  << ","
-                  << p95_ns
-                  << ","
-                  << p99_ns
-                  << ","
-                  << mean_cycles
-                  << ","
-                  << weighted_ns_per_event
-                  << ","
-                  << weighted_cycles_per_event
-                  << ","
-                  << weighted_ns_share
-                  << ","
-                  << weighted_cycles_share
-                  << ","
-                  << market_levels_mean
-                  << ","
-                  << market_levels_p95
-                  << ","
-                  << market_levels_p99
-                  << ","
-                  << market_filled_mean
-                  << ","
-                  << market_filled_p95
-                  << ","
-                  << market_filled_p99
-                  << "\n";
-            }
-        }
-
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-        EmitPmcProfile(total_ops);
-#endif
-    }
-
-#if LLMES_PROFILE_HFT_MACRO_OP_PMCS
-    void EmitPmcProfile(std::uint64_t total_ops) const {
-        if (!op_pmc_enabled_ || total_ops == 0) return;
-
-        const char* out_path = std::getenv("LLMES_HFT_MACRO_OP_PMC_OUT");
-        const bool write_csv = (out_path != nullptr && out_path[0] != '\0');
-        if (write_csv) {
-            benchmark_runner::EnsureCsvHeader(
-                out_path,
-                "scenario,version_tag,commit_sha,trial_id,seed,orders,levels,batch_size,"
-                "warmup_iters,iters,pmc_group,op_type,count,share,event_name,"
-                "event_total,event_per_op,weighted_event_per_macro_op");
-        }
-
-        const auto& event_names = op_perf_.EventNames();
-        std::cout << "macro_op_pmc_profile"
-                  << " scenario=" << Name()
-                  << " version_tag=" << profile_args_.version_tag
-                  << " commit_sha=" << profile_args_.commit_sha
-                  << " trial_id=" << profile_args_.trial_id
-                  << " seed=" << profile_args_.seed
-                  << " orders=" << profile_args_.orders
-                  << " levels=" << profile_args_.levels
-                  << " batch_size=" << profile_args_.batch_size
-                  << " warmup_iters=" << profile_args_.warmup_iters
-                  << " iters=" << profile_args_.iters
-                  << " pmc_group=" << op_pmc_group_name_
-                  << " total_ops=" << total_ops
-                  << "\n";
-
-        for (const auto& p : op_profile_) {
-            const double share = static_cast<double>(p.count) /
-                                 static_cast<double>(total_ops);
-            for (std::size_t i = 0; i < p.total_pmc.size(); ++i) {
-                const char* event_name =
-                    (i < event_names.size()) ? event_names[i].c_str() : "unknown";
-                const double event_per_op =
-                    (p.count > 0)
-                        ? static_cast<double>(p.total_pmc[i]) /
-                              static_cast<double>(p.count)
-                        : 0.0;
-                const double weighted_event_per_macro_op = share * event_per_op;
-
-                std::cout << "macro_op_pmc_profile"
-                          << " op_type=" << p.name
-                          << " pmc_group=" << op_pmc_group_name_
-                          << " event_name=" << event_name
-                          << " count=" << p.count
-                          << " share=" << share
-                          << " event_total=" << p.total_pmc[i]
-                          << " event_per_op=" << event_per_op
-                          << " weighted_event_per_macro_op="
-                          << weighted_event_per_macro_op
-                          << "\n";
-
-                if (write_csv) {
-                    std::ofstream f(out_path, std::ios::app);
-                    f << Name()
-                      << ","
-                      << profile_args_.version_tag
-                      << ","
-                      << profile_args_.commit_sha
-                      << ","
-                      << profile_args_.trial_id
-                      << ","
-                      << profile_args_.seed
-                      << ","
-                      << profile_args_.orders
-                      << ","
-                      << profile_args_.levels
-                      << ","
-                      << profile_args_.batch_size
-                      << ","
-                      << profile_args_.warmup_iters
-                      << ","
-                      << profile_args_.iters
-                      << ","
-                      << op_pmc_group_name_
-                      << ","
-                      << p.name
-                      << ","
-                      << p.count
-                      << ","
-                      << share
-                      << ","
-                      << event_name
-                      << ","
-                      << p.total_pmc[i]
-                      << ","
-                      << event_per_op
-                      << ","
-                      << weighted_event_per_macro_op
-                      << "\n";
-                }
-            }
-        }
-    }
-#endif
-#endif
 
     // ================================================================
     //  Tracking helpers -- only called during warmup + pre-generation

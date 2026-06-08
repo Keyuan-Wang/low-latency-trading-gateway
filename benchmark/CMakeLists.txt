@@ -78,17 +78,7 @@ add_executable(bench_hft_macro
 	src/hft/bench_hft_macro.cpp
 )
 target_link_libraries(bench_hft_macro PRIVATE benchmark_runner_lib)
-option(LLMES_PROFILE_HFT_MACRO_OPS "Enable per-operation profiling output for bench_hft_macro" OFF)
-if (LLMES_PROFILE_HFT_MACRO_OPS)
-	target_compile_definitions(bench_hft_macro PRIVATE LLMES_PROFILE_HFT_MACRO_OPS=1)
-endif()
-option(LLMES_PROFILE_HFT_MACRO_OP_PMCS "Enable per-operation PMC profiling output for bench_hft_macro" OFF)
-if (LLMES_PROFILE_HFT_MACRO_OP_PMCS)
-	target_compile_definitions(bench_hft_macro PRIVATE
-		LLMES_PROFILE_HFT_MACRO_OPS=1
-		LLMES_PROFILE_HFT_MACRO_OP_PMCS=1
-	)
-endif()
+
 # --- Smoke test ---
 add_executable(benchmark_smoke_test
 	tests/benchmark_smoke_test.cpp
