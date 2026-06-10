@@ -206,15 +206,11 @@ void RunUntimedWarmup(const benchmark_runner::Args& args,
 	workload.Teardown();
 }
 
-[[nodiscard]] bool ShouldMeasure(MacroScenario scenario,
-																 const std::vector<MacroScenario>& foci) {
-	return std::find(foci.begin(), foci.end(), scenario) != foci.end();
-}
-
 void RunMeasuredPass(const benchmark_runner::Args& args,
 										 std::uint64_t measurement_iter,
 										 std::uint64_t replay_iter_idx,
-										 const std::vector<MacroScenario>& foci,
+										 MacroScenario focus,
+										 bool record_composition,
 										 MeasurementOverhead timing_overhead,
 										 CampaignStats& stats) {
 	benchmark_runner::hft::HftMacroWorkload workload;
@@ -223,10 +219,12 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 	std::uint64_t ok = 0;
 	for (std::size_t i = 0; i < workload.size(); ++i) {
 		const MacroScenario scenario = workload.scenario(i);
-		const auto& op = workload.pending(i);
-		++stats.counts[benchmark_runner::hft::ScenarioIndex(scenario)];
+		if (record_composition) {
+			++stats.counts[benchmark_runner::hft::ScenarioIndex(scenario)];
+		}
 
-		if (ShouldMeasure(scenario, foci)) {
+		if (scenario == focus) {
+			const auto& op = workload.pending(i);
 			const auto ns0 = Clock::now();
 			const std::uint64_t t0 = ReadCycleStart();
 			(void)workload.Execute(i, ok);
@@ -262,7 +260,7 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 		}
 	}
 
-	stats.ok += ok;
+	if (record_composition) stats.ok += ok;
 	workload.Teardown();
 }
 
@@ -449,7 +447,10 @@ int main(int argc, char** argv) {
 
 	CampaignStats stats;
 	for (std::uint64_t i = 0; i < args.base.iters; ++i) {
-		RunMeasuredPass(args.base, i, iter_counter, foci, timing_overhead, stats);
+		for (std::size_t f = 0; f < foci.size(); ++f) {
+			RunMeasuredPass(args.base, i, iter_counter, foci[f], f == 0,
+											timing_overhead, stats);
+		}
 		++iter_counter;
 	}
 
