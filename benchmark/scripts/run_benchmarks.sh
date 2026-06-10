@@ -16,15 +16,15 @@ if (( DRY_RUN == 0 )); then
 	cmake --build "$ROOT/build" -j
 fi
 
-SCENARIOS_CSV="${SCENARIOS:-hft_add_near,hft_add_far,hft_cancel_hot,hft_cancel_cold,hft_modify_near,hft_market_small,hft_market_large}"
+SCENARIOS_CSV="${SCENARIOS:-hft_macro}"
 METRICS_CSV="${METRICS:-latency,pmc}"
-ORDERS_CSV="${ORDERS:-100,500,1000,5000,10000,50000,100000}"
-LEVELS_CSV="${LEVELS:-10,100,1000}"
-BATCH_SIZES_CSV="${BATCH_SIZES:-64}"
+ORDERS_CSV="${ORDERS:-100000}"
+LEVELS_CSV="${LEVELS:-100}"
+BATCH_SIZES_CSV="${BATCH_SIZES:-100000}"
 
 TRIALS="${TRIALS:-5}"
-ITERS="${ITERS:-1000}"
-WARMUP_ITERS="${WARMUP_ITERS:-100}"
+ITERS="${ITERS:-1}"
+WARMUP_ITERS="${WARMUP_ITERS:-1}"
 SEED="${SEED:-42}"
 VERSION_TAG="${VERSION_TAG:-baseline}"
 COMMIT_SHA="${COMMIT_SHA:-unknown}"
@@ -59,19 +59,6 @@ fi
 
 bin_for_scenario() {
 	case "$1" in
-		lmt_rest) echo "$ROOT/build/benchmark/bench_lmt_rest" ;;
-		lmt_cross_deep) echo "$ROOT/build/benchmark/bench_lmt_cross_deep" ;;
-		mkt_sweep_deep) echo "$ROOT/build/benchmark/bench_mkt_sweep_deep" ;;
-		cxl_hit) echo "$ROOT/build/benchmark/bench_cxl_hit" ;;
-		lmt_cross_shallow) echo "$ROOT/build/benchmark/bench_lmt_cross_shallow" ;;
-		overall) echo "$ROOT/build/benchmark/bench_overall" ;;
-		hft_add_near) echo "$ROOT/build/benchmark/bench_hft_add_near" ;;
-		hft_add_far) echo "$ROOT/build/benchmark/bench_hft_add_far" ;;
-		hft_cancel_hot) echo "$ROOT/build/benchmark/bench_hft_cancel_hot" ;;
-		hft_cancel_cold) echo "$ROOT/build/benchmark/bench_hft_cancel_cold" ;;
-		hft_modify_near) echo "$ROOT/build/benchmark/bench_hft_modify_near" ;;
-		hft_market_small) echo "$ROOT/build/benchmark/bench_hft_market_small" ;;
-		hft_market_large) echo "$ROOT/build/benchmark/bench_hft_market_large" ;;
 		hft_macro) echo "$ROOT/build/benchmark/bench_hft_macro" ;;
 		*)
 			echo "unknown scenario: $1" >&2
@@ -84,13 +71,6 @@ bin_for_scenario() {
 total_runs=0
 for trial in $(seq 1 "$TRIALS"); do
 	for scenario in "${SCENARIOS[@]}"; do
-		if [[ "$scenario" == "overall" ]]; then
-			# overall: one config per metric, not a matrix
-			for metric in "${METRICS[@]}"; do
-				(( total_runs++ )) || true
-			done
-			continue
-		fi
 		for metric in "${METRICS[@]}"; do
 			for orders in "${ORDERS_ARR[@]}"; do
 				for levels in "${LEVELS_ARR[@]}"; do
@@ -108,50 +88,6 @@ current_run=0
 for trial in $(seq 1 "$TRIALS"); do
 	for scenario in "${SCENARIOS[@]}"; do
 		BIN="$(bin_for_scenario "$scenario")"
-
-		if [[ "$scenario" == "overall" ]]; then
-			(( current_run++ )) || true
-			eff_orders=100000
-			eff_levels=100
-			eff_batch=100000
-			eff_iters=1
-			for metric in "${METRICS[@]}"; do
-				if [[ "$metric" == "latency" ]]; then
-					out_file="$LAT_CSV"
-				elif [[ "$metric" == "pmc" ]]; then
-					out_file="$PMC_CSV"
-				else
-					echo "unknown metric: $metric" >&2
-					exit 2
-				fi
-
-				printf "[%3d/%3d] trial=%-2d scenario=%-15s metric=%-7s orders=%-6s levels=%-4s batch=%-3s " \
-					"$current_run" "$total_runs" "$trial" "$scenario" "$metric" "$eff_orders" "$eff_levels" "$eff_batch"
-
-				if (( DRY_RUN == 1 )); then
-					echo "(dry-run)"
-				else
-					if "$BIN" \
-						--metric "$metric" \
-						--trial-id "$trial" \
-						--orders "$eff_orders" \
-						--levels "$eff_levels" \
-						--batch-size "$eff_batch" \
-						--warmup-iters 1 \
-						--iters "$eff_iters" \
-						--seed "$SEED" \
-						--version-tag "$VERSION_TAG" \
-						--commit-sha "$COMMIT_SHA" \
-						--out "$out_file" > /dev/null; then
-						echo "ok"
-					else
-						echo "FAIL"
-						exit 1
-					fi
-				fi
-			done
-			continue
-		fi
 
 		for metric in "${METRICS[@]}"; do
 			for orders in "${ORDERS_ARR[@]}"; do

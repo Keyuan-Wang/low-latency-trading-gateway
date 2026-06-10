@@ -42,14 +42,14 @@ REMOTE_TARBALL="${REMOTE_TARBALL:-$REMOTE_ROOT/bench_compare_artifacts.tgz}"
 LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-./server_results}"
 
 # --- benchmark campaign params (applied to every version) ---
-SCENARIOS="${SCENARIOS:-hft_add_near,hft_add_far,hft_cancel_hot,hft_cancel_cold,hft_modify_near,hft_market_small,hft_market_large}"
+SCENARIOS="${SCENARIOS:-hft_macro}"
 METRICS="${METRICS:-latency,pmc}"
-ORDERS="${ORDERS:-100,500,1000,5000,10000,50000,100000}"
-LEVELS="${LEVELS:-10,100,1000}"
-BATCH_SIZES="${BATCH_SIZES:-64}"
+ORDERS="${ORDERS:-100000}"
+LEVELS="${LEVELS:-100}"
+BATCH_SIZES="${BATCH_SIZES:-100000}"
 TRIALS="${TRIALS:-10}"
-ITERS="${ITERS:-1000}"
-WARMUP_ITERS="${WARMUP_ITERS:-100}"
+ITERS="${ITERS:-1}"
+WARMUP_ITERS="${WARMUP_ITERS:-1}"
 SEED="${SEED:-42}"
 
 # --- plot params ---
@@ -218,12 +218,6 @@ for ((idx=0; idx<N; idx++)); do
   LAT_FILES+=("$RES_DIR/${prefix}_latency_raw_trials.csv")
   PMC_FILES+=("$RES_DIR/${prefix}_pmc_raw_trials.csv")
 
-  # ---- HFT macro benchmark (separate params) ----
-  echo "--- HFT macro benchmark ($tag) ---"
-  OUT_PREFIX="macro_${prefix}" TRIALS="$TRIALS" SCENARIOS="hft_macro" \
-    ORDERS=100000 LEVELS=100 BATCH_SIZES=100000 ITERS=1 WARMUP_ITERS=1 \
-    VERSION_TAG="$tag" COMMIT_SHA="$sha" \
-    bash benchmark/scripts/run_benchmarks.sh 2>&1 | tee "$REMOTE_ARTIFACTS_DIR/run_macro_${prefix}.log"
 done
 
 # ---- 5. Merge all versions ----
