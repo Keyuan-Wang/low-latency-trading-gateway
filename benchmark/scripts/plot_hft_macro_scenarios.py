@@ -59,17 +59,44 @@ if out_path:
 else:
 	out_png = csv_path.with_name(csv_path.stem + "_distributions.png")
 
-OP_ORDER = ["add_rest", "cancel_order", "modify_order"]
-OP_LABELS = {
-	"add_rest": "Add rest",
-	"cancel_order": "Cancel order",
-	"modify_order": "Modify order",
+OP_PRESETS: dict[str, dict[str, str]] = {
+	"current": {
+		"order": "add_rest_existing_level,add_rest_new_level,cancel_order",
+		"add_rest_existing_level": "Add rest (existing level)",
+		"add_rest_new_level": "Add rest (new level)",
+		"cancel_order": "Cancel order",
+		"add_rest_existing_level_color": "#4C78A8",
+		"add_rest_new_level_color": "#72B7B2",
+		"cancel_order_color": "#2CA02C",
+	},
+	"legacy": {
+		"order": "add_rest,cancel_order,modify_order",
+		"add_rest": "Add rest",
+		"cancel_order": "Cancel order",
+		"modify_order": "Modify order",
+		"add_rest_color": "#4C78A8",
+		"cancel_order_color": "#2CA02C",
+		"modify_order_color": "#D62728",
+	},
 }
-OP_COLORS = {
-	"add_rest": "#4C78A8",
-	"cancel_order": "#2CA02C",
-	"modify_order": "#D62728",
-}
+
+
+def resolve_op_layout(df: pd.DataFrame) -> tuple[list[str], dict[str, str], dict[str, str]]:
+	present = set(df["op_type"].astype(str))
+	if {"add_rest_existing_level", "add_rest_new_level"} & present:
+		preset = OP_PRESETS["current"]
+	elif "add_rest" in present or "modify_order" in present:
+		preset = OP_PRESETS["legacy"]
+	else:
+		raise RuntimeError(f"Unrecognized op_type values: {sorted(present)}")
+
+	op_order = [op for op in preset["order"].split(",") if op in present]
+	if len(op_order) != 3:
+		raise RuntimeError(f"Expected 3 measured op types, found: {op_order}")
+
+	labels = {op: preset[op] for op in op_order}
+	colors = {op: preset[f"{op}_color"] for op in op_order}
+	return op_order, labels, colors
 
 METRICS = [
 	("cycles", "CPU cycles (adjusted)"),
@@ -98,7 +125,8 @@ def load_calls(path: Path) -> pd.DataFrame:
 		"version_tag",
 	]
 	df = pd.read_csv(path, usecols=usecols)
-	df = df[df["op_type"].isin(OP_ORDER)].copy()
+	op_order, _, _ = resolve_op_layout(df)
+	df = df[df["op_type"].isin(op_order)].copy()
 	if trial_ids is not None:
 		df = df[df["trial_id"].isin(trial_ids)]
 	if df.empty:
@@ -208,6 +236,7 @@ def draw_panel(
 
 def main() -> int:
 	df = load_calls(csv_path)
+	op_order, op_labels, op_colors = resolve_op_layout(df)
 
 	meta_commit = str(df["commit_sha"].iloc[0])
 	meta_tag = str(df["version_tag"].iloc[0])
@@ -229,16 +258,16 @@ def main() -> int:
 	gs = GridSpec(2, 3, figure=fig, hspace=0.34, wspace=0.22)
 
 	for row_idx, (metric_col, row_ylabel) in enumerate(METRICS):
-		for col_idx, op in enumerate(OP_ORDER):
+		for col_idx, op in enumerate(op_order):
 			ax = fig.add_subplot(gs[row_idx, col_idx])
 			values = df.loc[df["op_type"] == op, metric_col].to_numpy(dtype=float)
 			stats = percentile_stats(values)
 			draw_panel(
 				ax,
 				values,
-				title=f"{OP_LABELS[op]}",
+				title=f"{op_labels[op]}",
 				xlabel=row_ylabel,
-				color=OP_COLORS[op],
+				color=op_colors[op],
 				n_bins=bins,
 				clip_pct=clip_pct,
 				stats=stats,
@@ -248,8 +277,8 @@ def main() -> int:
 				ax.set_ylabel(f"{row_title}\ncount")
 
 	legend_handles = [
-		Patch(facecolor=OP_COLORS[op], edgecolor="white", label=OP_LABELS[op])
-		for op in OP_ORDER
+		Patch(facecolor=op_colors[op], edgecolor="white", label=op_labels[op])
+		for op in op_order
 	]
 	legend_handles.extend([
 		plt.Line2D([0], [0], color="#1F1F1F", linestyle="-", linewidth=1.2, label="p50"),

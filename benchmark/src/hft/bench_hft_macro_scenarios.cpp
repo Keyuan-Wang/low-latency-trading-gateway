@@ -51,6 +51,9 @@ struct ScenarioSample {
 	std::uint64_t replay_iter_idx = 0;
 	std::uint64_t op_index = 0;
 	std::uint64_t scenario_call_index = 0;
+	matching::Side side = matching::Side::Buy;
+	std::int64_t price = 0;
+	std::uint64_t qty = 0;
 	std::uint64_t raw_cycles = 0;
 	std::uint64_t cycles = 0;
 	std::uint64_t raw_elapsed_ns = 0;
@@ -188,6 +191,10 @@ void ParseArgs(int argc, char** argv, ScenarioArgs& args) {
 	return {ParseFocusOne(focus)};
 }
 
+[[nodiscard]] const char* SideName(matching::Side side) noexcept {
+	return side == matching::Side::Buy ? "buy" : "sell";
+}
+
 void RunUntimedWarmup(const benchmark_runner::Args& args,
 											std::uint64_t iter_idx) {
 	benchmark_runner::hft::HftMacroWorkload workload;
@@ -199,11 +206,15 @@ void RunUntimedWarmup(const benchmark_runner::Args& args,
 	workload.Teardown();
 }
 
+[[nodiscard]] bool ShouldMeasure(MacroScenario scenario,
+																 const std::vector<MacroScenario>& foci) {
+	return std::find(foci.begin(), foci.end(), scenario) != foci.end();
+}
+
 void RunMeasuredPass(const benchmark_runner::Args& args,
 										 std::uint64_t measurement_iter,
 										 std::uint64_t replay_iter_idx,
-										 MacroScenario focus,
-										 bool record_composition,
+										 const std::vector<MacroScenario>& foci,
 										 MeasurementOverhead timing_overhead,
 										 CampaignStats& stats) {
 	benchmark_runner::hft::HftMacroWorkload workload;
@@ -212,11 +223,10 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 	std::uint64_t ok = 0;
 	for (std::size_t i = 0; i < workload.size(); ++i) {
 		const MacroScenario scenario = workload.scenario(i);
-		if (record_composition) {
-			++stats.counts[benchmark_runner::hft::ScenarioIndex(scenario)];
-		}
+		const auto& op = workload.pending(i);
+		++stats.counts[benchmark_runner::hft::ScenarioIndex(scenario)];
 
-		if (scenario == focus) {
+		if (ShouldMeasure(scenario, foci)) {
 			const auto ns0 = Clock::now();
 			const std::uint64_t t0 = ReadCycleStart();
 			(void)workload.Execute(i, ok);
@@ -240,6 +250,9 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 					replay_iter_idx,
 					static_cast<std::uint64_t>(i),
 					static_cast<std::uint64_t>(samples.size()),
+					op.side,
+					op.price,
+					op.qty,
 					raw,
 					adjusted,
 					raw_elapsed,
@@ -249,7 +262,7 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 		}
 	}
 
-	if (record_composition) stats.ok += ok;
+	stats.ok += ok;
 	workload.Teardown();
 }
 
@@ -330,8 +343,8 @@ void WriteCsvSamples(const ScenarioArgs& args,
 			args.base.out_csv,
 			"mode,scenario,op_type,version_tag,commit_sha,trial_id,orders,levels,"
 			"batch_size,warmup_iters,iters,seed,measurement_iter,replay_iter_idx,"
-			"op_index,scenario_call_index,raw_cycles,cycles,timing_overhead_cycles,"
-			"raw_elapsed_ns,elapsed_ns,elapsed_overhead_ns");
+			"op_index,scenario_call_index,side,price,qty,raw_cycles,cycles,"
+			"timing_overhead_cycles,raw_elapsed_ns,elapsed_ns,elapsed_overhead_ns");
 
 	std::ofstream f(args.base.out_csv, std::ios::app);
 	const std::array<MacroScenario, 3> measured_rows = {
@@ -398,6 +411,12 @@ void WriteCsvSamples(const ScenarioArgs& args,
 				<< ","
 				<< sample.scenario_call_index
 				<< ","
+				<< SideName(sample.side)
+				<< ","
+				<< sample.price
+				<< ","
+				<< sample.qty
+				<< ","
 				<< sample.raw_cycles
 				<< ","
 				<< sample.cycles
@@ -430,10 +449,7 @@ int main(int argc, char** argv) {
 
 	CampaignStats stats;
 	for (std::uint64_t i = 0; i < args.base.iters; ++i) {
-		for (std::size_t f = 0; f < foci.size(); ++f) {
-			RunMeasuredPass(args.base, i, iter_counter, foci[f], f == 0,
-											timing_overhead, stats);
-		}
+		RunMeasuredPass(args.base, i, iter_counter, foci, timing_overhead, stats);
 		++iter_counter;
 	}
 
