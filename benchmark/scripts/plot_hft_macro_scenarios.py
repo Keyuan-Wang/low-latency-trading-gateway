@@ -123,6 +123,7 @@ def load_calls(path: Path) -> pd.DataFrame:
 		"commit_sha",
 		"trial_id",
 		"version_tag",
+		"seed",
 	]
 	df = pd.read_csv(path, usecols=usecols)
 	op_order, _, _ = resolve_op_layout(df)
@@ -249,6 +250,9 @@ def main() -> int:
 	meta_tag = str(df["version_tag"].iloc[0])
 	meta_trials = sorted(df["trial_id"].unique().tolist())
 	meta_n = len(df)
+	meta_seed = int(df["seed"].iloc[0])
+	if df["seed"].nunique() != 1:
+		raise RuntimeError(f"Expected one seed across pooled trials, found: {sorted(df['seed'].unique())}")
 
 	plt.style.use("seaborn-v0_8-whitegrid")
 	plt.rcParams.update({
@@ -295,9 +299,9 @@ def main() -> int:
 
 	trial_str = ",".join(str(t) for t in meta_trials)
 	fig.suptitle(
-		f"hft_macro per-scenario distributions  ·  {meta_tag}@{meta_commit}  ·  "
-		f"trials=[{trial_str}]  ·  calls={meta_n:,}  ·  bins={bins}  ·  "
-		f"x-axis ≤ max(p{clip_pct:g}, p999)",
+		f"hft_macro per-scenario distributions (pooled)  ·  {meta_tag}@{meta_commit}  ·  "
+		f"trials={len(meta_trials)} [{trial_str}]  ·  seed={meta_seed}  ·  "
+		f"calls={meta_n:,}  ·  bins={bins}  ·  x-axis ≤ max(p{clip_pct:g}, p999)",
 		fontsize=12.5,
 		fontweight="bold",
 		y=1.02,
