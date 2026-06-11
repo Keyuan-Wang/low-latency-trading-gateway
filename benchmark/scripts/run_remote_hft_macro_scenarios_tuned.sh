@@ -307,6 +307,49 @@ capture_kernel_activity() {
 	cat /proc/interrupts > "$dir/interrupts_${phase}.txt" 2>/dev/null || true
 	cat /proc/softirqs > "$dir/softirqs_${phase}.txt" 2>/dev/null || true
 	cat /proc/schedstat > "$dir/schedstat_${phase}.txt" 2>/dev/null || true
+	python3 - "$dir/interrupts_${phase}.txt" "$dir/irq_affinity_${phase}.txt" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+interrupts = Path(sys.argv[1])
+out = Path(sys.argv[2])
+
+def read_first(path):
+	try:
+		return Path(path).read_text(errors="ignore").strip()
+	except OSError:
+		return ""
+
+rows = []
+for line in interrupts.read_text(errors="ignore").splitlines():
+	if ":" not in line:
+		continue
+	name, rest = line.split(":", 1)
+	irq = name.strip()
+	if not re.fullmatch(r"\d+", irq):
+		continue
+	label = " ".join([irq] + rest.split())
+	base = Path("/proc/irq") / irq
+	rows.append(
+		(
+			irq,
+			read_first(base / "smp_affinity_list"),
+			read_first(base / "smp_affinity"),
+			read_first(base / "effective_affinity_list"),
+			read_first(base / "effective_affinity"),
+			label,
+		)
+	)
+
+with out.open("w") as fh:
+	fh.write(
+		"irq\tsmp_affinity_list\tsmp_affinity\teffective_affinity_list\t"
+		"effective_affinity\tlabel\n"
+	)
+	for row in rows:
+		fh.write("\t".join(row) + "\n")
+PY
 }
 
 summarize_kernel_activity_delta() {
@@ -388,12 +431,31 @@ def parse_schedstat(path):
 def row_map(rows):
 	return {label: values for label, values in rows}
 
+def parse_irq_affinity(path):
+	affinity = {}
+	if not path.exists():
+		return affinity
+	for line in path.read_text(errors="ignore").splitlines()[1:]:
+		parts = line.split("\t")
+		if len(parts) < 6:
+			continue
+		irq, smp_list, smp_mask, effective_list, effective_mask, label = parts[:6]
+		affinity[irq] = {
+			"smp_affinity_list": smp_list,
+			"smp_affinity": smp_mask,
+			"effective_affinity_list": effective_list,
+			"effective_affinity": effective_mask,
+			"label": label,
+		}
+	return affinity
+
 def write_irq_like(title, before_file, after_file, parser, fh):
 	before_count, before_rows = parser(before_file)
 	after_count, after_rows = parser(after_file)
 	cpu_count = min(before_count, after_count)
 	before = row_map(before_rows)
 	after = row_map(after_rows)
+	affinity = parse_irq_affinity(after_dir / "irq_affinity_after.txt")
 	labels = sorted(set(before) | set(after))
 	fh.write(f"===== {title} delta =====\n")
 	fh.write(f"cpu_count={cpu_count} bench_cpu={bench_cpu}\n")
@@ -417,6 +479,21 @@ def write_irq_like(title, before_file, after_file, parser, fh):
 			f"  bench_cpu_delta={bench_delta} total_delta={total_delta} "
 			f"label={label} per_cpu={d}\n"
 		)
+	if title == "interrupts":
+		fh.write("irq_affinity_for_top_interrupt_rows:\n")
+		for bench_delta, total_delta, label, d in sorted(entries, reverse=True)[:20]:
+			if bench_delta == 0 and total_delta == 0:
+				continue
+			irq = label.split(maxsplit=1)[0]
+			if irq not in affinity:
+				continue
+			info = affinity[irq]
+			fh.write(
+				f"  irq={irq} bench_cpu_delta={bench_delta} "
+				f"smp_affinity_list={info['smp_affinity_list']} "
+				f"effective_affinity_list={info['effective_affinity_list']} "
+				f"label={info['label']}\n"
+			)
 	fh.write("\n")
 
 def write_schedstat(before_file, after_file, fh):
