@@ -20,6 +20,29 @@ It separates the measured single-operation paths into:
 
 The result confirms that `cancel_order` is very cheap and stable, while `add_rest_new_level` is the major source of add-rest tail latency.
 
+The final stage of Phase 9 pushed the Linux-side tuning as far as is practical on the cloud VM: dynamic CPU selection, IRQ affinity control, SMT-sibling avoidance, aggressive workqueue/watchdog/realtime tuning, and finally boot-time `nohz_full` isolation. The system counters became much cleaner, but the per-scenario p99 latency did not materially improve. This closes Phase 9 with an important negative result: the remaining p99 behavior is no longer dominated by easily removable Linux-system noise.
+
+## Measurement Environment
+
+All Phase 9 benchmark results discussed in this report were collected on the remote Hetzner CCX23 benchmark server.
+
+| Field | Value |
+|---|---|
+| provider / machine | Hetzner Cloud CCX23 |
+| virtualization | KVM guest |
+| CPU model | AMD EPYC-Milan Processor |
+| logical CPUs | 4 |
+| core topology | 2 physical cores, SMT=2 |
+| benchmark CPU | CPU2 unless otherwise stated |
+| SMT sibling set | CPU2 sibling set = `2-3` |
+| NUMA topology | 1 NUMA node, node0 CPUs = `0-3` |
+| memory | about 16 GB |
+| kernel | Ubuntu Linux `7.0.0-15-generic` |
+| compiler | g++ `15.2.0` |
+| CMake | `4.2.3` |
+
+The local development machine is not used as the measurement environment for the results interpreted here.
+
 ## Existing Benchmark Setup
 
 ### HFT Macro Benchmark
@@ -284,9 +307,13 @@ Environment summary:
 | orders | `100000` |
 | levels | `100` |
 | batch size | `100000` |
-| CPU | AMD Ryzen 7 7840HS |
-| kernel | WSL2 Linux 6.6.87.2 |
-| compiler | g++ 13.3.0 |
+| server | Hetzner Cloud CCX23 |
+| virtualization | KVM guest |
+| CPU | AMD EPYC-Milan Processor |
+| topology | 4 logical CPUs, 2 physical cores, SMT=2 |
+| NUMA | 1 node, node0 CPUs = `0-3` |
+| kernel | Ubuntu Linux `7.0.0-15-generic` |
+| compiler | g++ `15.2.0` |
 
 The output CSV contains 937,410 measured calls:
 
@@ -409,9 +436,7 @@ On multi-NUMA systems, bind CPU and memory to the same node:
 numactl --physcpubind=<cpu> --membind=<node> ...
 ```
 
-The current WSL environment reports one NUMA node, but cloud or bare-metal benchmark machines may not.
-
-The 2026-06-11 cloud VM also reports one NUMA node:
+The Hetzner CCX23 benchmark VM reports one NUMA node:
 
 ```text
 available: 1 nodes (0)
@@ -613,33 +638,137 @@ was similar, with a slightly larger p999 tail:
 
 The important conclusion is not that the exact p999 values are fixed. It is that the tuned setup dramatically reduces the system-noise component of the per-scenario distribution, while the kernel snapshots now make the remaining noise visible.
 
-## Current Next Step
+## Final System-Level Tuning Stage
 
-The next low-risk experiment is optional IRQ affinity avoidance:
+The final part of Phase 9 tested whether the remaining per-scenario p99 tail was still mostly caused by Linux scheduling, interrupts, softirqs, or VM housekeeping.
+
+Three progressively stronger configurations were tested on the same cloud VM and commit:
+
+| Stage | Artifact | Description |
+|---|---|---|
+| dynamic CPU + IRQ move | `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_002441/` | automatic clean-CPU selection, NUMA binding, IRQ affinity movement away from the benchmark CPU |
+| aggressive isolation | `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_005335/` | SMT-sibling IRQ avoidance, workqueue cpumask movement, `chrt -f 95`, watchdog off, RT throttling off, CPU DMA latency lock |
+| boot-time `nohz_full` | `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_014047/` | `nohz_full`, `rcu_nocbs`, `isolcpus`, `irqaffinity`, and `kthread_cpus` applied through GRUB and reboot |
+
+The `nohz_full` setup result is:
 
 ```text
-AVOID_IRQ_ON_BENCH_CPU=1
+server_results/nohz_full_setup_20260612_023844/
 ```
 
-The intended behavior is:
+The post-reboot verification confirmed that the kernel command line contained:
 
-- only move ordinary numbered device IRQs;
-- avoid the benchmark CPU in `smp_affinity_list`;
-- record before/after affinity;
-- restore affinity on exit if requested;
-- leave `LOC`, `RCU`, `TIMER`, and scheduler housekeeping untouched.
+```text
+nohz_full=2,3
+rcu_nocbs=2,3
+isolcpus=nohz,domain,managed_irq,2,3
+irqaffinity=0,1
+kthread_cpus=0,1
+nowatchdog
+nmi_watchdog=0
+```
 
-This should test whether moving device IRQs such as `virtio5-request` and `virtio1-input.0` away from the benchmark CPU reduces p999/max without requiring boot-level isolation.
+and:
 
-Stronger options remain available but are more invasive:
+```text
+/sys/devices/system/cpu/nohz_full=2-3
+```
 
-- `isolcpus=<cpu>`
-- `nohz_full=<cpu>`
-- `rcu_nocbs=<cpu>`
-- C-state restrictions
-- disabling SMT
+The benchmark itself continued to run on CPU2:
 
-Those should be treated as later, dedicated experiments rather than the default benchmark setup.
+```text
+chrt -f 95 numactl --physcpubind=2 --membind=0
+```
+
+### Kernel Activity Effect
+
+The system-level tuning did reduce kernel activity on CPU2.
+
+| Stage | LOC on CPU2 | IRQ38 on CPU2 | RCU on CPU2 | TIMER on CPU2 | SCHED on CPU2 | Softirq total on CPU2 |
+|---|---:|---:|---:|---:|---:|---:|
+| dynamic CPU + IRQ move | 15590 | 102 | 1239 | 635 | 380 | 2254 |
+| aggressive isolation | 15319 | 106 | 1332 | 639 | 368 | 2339 |
+| `nohz_full` | 4695 | 113 | 117 | 11 | 91 | 219 |
+
+This proves that `nohz_full` and `rcu_nocbs` were not a no-op. They reduced benchmark-CPU softirqs by roughly an order of magnitude and also reduced local timer interrupt activity substantially.
+
+However, not everything can be moved:
+
+- `IRQ38 virtio5-request` remained pinned to CPU2.
+- Attempts to move it failed with `Operation not permitted`.
+- `LOC` was reduced but not eliminated, which is expected for a guest VM.
+- Some host/KVM behavior remains outside the guest kernel's control.
+
+### Latency Effect
+
+Despite the cleaner kernel counters, the p99 latency distribution did not materially improve.
+
+Adjusted cycle results:
+
+| Stage | Scenario | Mean | p50 | p95 | p99 | p999 |
+|---|---|---:|---:|---:|---:|---:|
+| dynamic CPU + IRQ move | `add_rest_existing_level` | 29.19 | 22 | 44 | 44 | 66 |
+| dynamic CPU + IRQ move | `add_rest_new_level` | 37.91 | 22 | 88 | 154 | 286 |
+| dynamic CPU + IRQ move | `cancel_order` | 18.98 | 22 | 44 | 44 | 44 |
+| aggressive isolation | `add_rest_existing_level` | 33.74 | 22 | 44 | 44 | 66 |
+| aggressive isolation | `add_rest_new_level` | 41.98 | 44 | 88 | 154 | 286 |
+| aggressive isolation | `cancel_order` | 24.67 | 22 | 44 | 44 | 44 |
+| `nohz_full` | `add_rest_existing_level` | 20.97 | 22 | 44 | 44 | 66 |
+| `nohz_full` | `add_rest_new_level` | 31.74 | 22 | 88 | 154 | 286 |
+| `nohz_full` | `cancel_order` | 13.03 | 0 | 44 | 44 | 44 |
+
+The `0` cycle p50 for `nohz_full` `cancel_order` is an overhead-adjustment artifact caused by subtracting the measured timing overhead from an extremely short operation. It should not be interpreted as literal zero work; the p95/p99/p999 values are more meaningful for that path.
+
+Adjusted elapsed-time results:
+
+| Stage | Scenario | Mean ns | p50 ns | p95 ns | p99 ns | p999 ns |
+|---|---|---:|---:|---:|---:|---:|
+| dynamic CPU + IRQ move | `add_rest_existing_level` | 13.52 | 11 | 21 | 22 | 32 |
+| dynamic CPU + IRQ move | `add_rest_new_level` | 17.42 | 11 | 41 | 71 | 137.61 |
+| dynamic CPU + IRQ move | `cancel_order` | 8.38 | 10 | 21 | 21 | 22 |
+| aggressive isolation | `add_rest_existing_level` | 16.31 | 11 | 21 | 22 | 40 |
+| aggressive isolation | `add_rest_new_level` | 18.89 | 12 | 40 | 71 | 131 |
+| aggressive isolation | `cancel_order` | 11.09 | 10 | 21 | 21 | 22 |
+| `nohz_full` | `add_rest_existing_level` | 11.69 | 11 | 21 | 22 | 32 |
+| `nohz_full` | `add_rest_new_level` | 17.90 | 11 | 41 | 80 | 141 |
+| `nohz_full` | `cancel_order` | 8.87 | 10 | 21 | 21 | 31 |
+
+The p99 cycle values are identical across all three final stages:
+
+| Scenario | p99 cycles |
+|---|---:|
+| `add_rest_existing_level` | 44 |
+| `add_rest_new_level` | 154 |
+| `cancel_order` | 44 |
+
+The elapsed p99 values are also effectively unchanged:
+
+| Scenario | dynamic CPU + IRQ move | aggressive isolation | `nohz_full` |
+|---|---:|---:|---:|
+| `add_rest_existing_level` | 22 ns | 22 ns | 22 ns |
+| `add_rest_new_level` | 71 ns | 71 ns | 80 ns |
+| `cancel_order` | 21 ns | 21 ns | 21 ns |
+
+This is the key final-stage result. The Linux-level tuning successfully removed a large amount of measured kernel activity, but the benchmark's p99 operation latency did not follow. Therefore the remaining p99 distribution is not primarily caused by ordinary movable IRQs, workqueues, watchdogs, RCU callbacks, or periodic scheduler ticks.
+
+### Final Interpretation
+
+The system-level work was still useful. It proved that:
+
+1. The tuned per-scenario runner can select a clean CPU automatically.
+2. Ordinary device IRQs can be moved away from the benchmark CPU.
+3. SMT-sibling IRQ avoidance and workqueue pinning are observable in the artifacts.
+4. Boot-time `nohz_full` reduces CPU2 `LOC` and softirq activity substantially.
+5. These reductions do not translate into a meaningful p99 latency improvement for the current workload.
+
+The remaining system-side noise is either:
+
+- local timer / APIC / KVM activity that cannot be fully removed in the guest;
+- pinned virtio queue IRQs such as IRQ38;
+- residual VM host scheduling effects;
+- or noise below the threshold that currently determines p99.
+
+Further Linux tuning is unlikely to be a productive Phase 9 direction unless the environment changes to bare metal or a VM with controllable virtio queue affinity.
 
 ## Final Position
 
@@ -647,4 +776,18 @@ Phase 9 does not replace the macro benchmark. It adds a diagnostic lens.
 
 The standard `hft_macro` benchmark remains the metric for release-level performance decisions. `perf record` remains the tool for instruction-level attribution. The per-scenario benchmark is useful because it preserves the real macro workload while exposing which single-operation classes generate latency tails.
 
-The first per-scenario result was actionable: `add_rest_new_level` is the expensive measured path, while `cancel_order` is already extremely compact in the common case. The subsequent tuned runs showed that system-level measurement hygiene materially changes p99/p999, so per-scenario latency should be reported together with CPU binding, NUMA binding, SMT sibling, and kernel activity metadata.
+The first per-scenario result was actionable: `add_rest_new_level` is the expensive measured path, while `cancel_order` is already extremely compact in the common case.
+
+The system-level tuning work then established a clean measurement framework:
+
+- benchmark CPU and NUMA binding;
+- SMT-sibling awareness;
+- dynamic clean-CPU selection;
+- IRQ affinity snapshots and movement;
+- kernel activity snapshots;
+- aggressive optional isolation controls;
+- boot-time `nohz_full` validation.
+
+The final `nohz_full` experiment closes the system-tuning thread. It reduced observable kernel activity but did not reduce p99 latency. That makes the next optimization target clear: return to matching-engine internals, especially the `add_rest_new_level` path and the work needed to activate a previously empty price level.
+
+For Phase 10, the strongest candidate is no longer Linux hygiene. It is instruction-count reduction inside the add-new-level path.
