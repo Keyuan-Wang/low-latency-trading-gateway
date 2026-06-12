@@ -347,6 +347,10 @@ Adjusted elapsed-time results:
 | `add_rest_new_level` | 31.98 | 20 | 73 | 144 | 193 | 414 |
 | `cancel_order` | 13.78 | 11 | 22 | 33 | 40 | 196 |
 
+Pooled latency distributions (10 trials, 100 bins, x-axis clipped at max(p99.5, p999)):
+
+![Untuned per-scenario distributions](phase9_untuned_20260610_200842_distributions.png)
+
 The key observations are:
 
 1. `cancel_order` is very cheap in the common case.
@@ -608,6 +612,8 @@ used CPU1, which shared a physical core with CPU0. Even so, the improvement was 
 | `add_rest_new_level` | 144 ns | 61 ns |
 | `cancel_order` | 33 ns | 12 ns |
 
+![First tuned run distributions (CPU1, shared core with CPU0)](phase9_tuned_20260611_224657_distributions.png)
+
 The later 10-trial run with CPU2:
 
 ```text
@@ -622,6 +628,8 @@ produced:
 | `add_rest_new_level` | 22 | 88 | 154 | 286 | 11 ns | 41 ns | 71 ns | 132 ns |
 | `cancel_order` | 22 | 44 | 44 | 44 | 10 ns | 20 ns | 21 ns | 22 ns |
 
+![CPU2 tuned run distributions (10 trials pooled)](phase9_tuned_20260611_232354_distributions.png)
+
 The next 10-trial run with IRQ affinity observation:
 
 ```text
@@ -635,6 +643,8 @@ was similar, with a slightly larger p999 tail:
 | `add_rest_existing_level` | 22 | 44 | 44 | 66 | 11 ns | 21 ns | 22 ns | 40.2 ns |
 | `add_rest_new_level` | 44 | 88 | 154 | 308 | 11 ns | 41 ns | 71 ns | 150 ns |
 | `cancel_order` | 22 | 44 | 44 | 44 | 10 ns | 21 ns | 21 ns | 31 ns |
+
+![IRQ affinity observation run distributions (10 trials pooled)](phase9_tuned_20260611_233122_distributions.png)
 
 The important conclusion is not that the exact p999 values are fixed. It is that the tuned setup dramatically reduces the system-noise component of the per-scenario distribution, while the kernel snapshots now make the remaining noise visible.
 
@@ -698,6 +708,14 @@ However, not everything can be moved:
 - Attempts to move it failed with `Operation not permitted`.
 - `LOC` was reduced but not eliminated, which is expected for a guest VM.
 - Some host/KVM behavior remains outside the guest kernel's control.
+
+Pooled per-scenario distributions for the three final tuning stages (10 trials each):
+
+![Dynamic CPU selection + IRQ move](phase9_tuned_20260612_002441_distributions.png)
+
+![Aggressive isolation (workqueue cpumask, chrt FIFO, watchdog off)](phase9_tuned_20260612_005335_distributions.png)
+
+![Boot-time nohz_full isolation (CPU2–3 isolated, housekeeping on CPU0–1)](phase9_tuned_20260612_014047_distributions.png)
 
 ### Latency Effect
 
