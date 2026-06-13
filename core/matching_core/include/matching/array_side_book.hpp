@@ -38,6 +38,11 @@ public:
         return levels_[best_price_idx_];
     };
 
+    [[gnu::always_inline]] void prefetch_level(std::uint64_t price) noexcept {
+        const std::size_t idx = idx_of(price);
+        __builtin_prefetch(&levels_[idx], 1, 3);
+    }
+
     PriceLevel* get_or_create(std::int64_t price) noexcept {
         const std::size_t idx = idx_of(price);
 
