@@ -79,11 +79,20 @@ inline const char* OccupancySetPathName(OccupancySetPath path) noexcept {
 inline constexpr std::uint64_t kNoPreviousLevelTouch =
 		std::numeric_limits<std::uint64_t>::max();
 
+// Same sentinel as kNoPreviousLevelTouch, but for the order-pool slot dimension:
+// marks the first time a given pool slot is acquired by a measured add.
+inline constexpr std::uint64_t kNoPreviousSlotTouch =
+		std::numeric_limits<std::uint64_t>::max();
+
 struct PendingAttribution {
 	OccupancySetPath occupancy_set_path = OccupancySetPath::NotApplicable;
 	std::uint16_t occupancy_l1_popcount_before = 0;
 	std::uint8_t price_mod8 = 0;
 	std::uint64_t level_reuse_distance_ops = kNoPreviousLevelTouch;
+	// Ops since the order-pool slot this add will acquire was last acquired.
+	// PriceLevel reuse (above) and order-pool-slot reuse are decoupled: a level
+	// can be hot while the slot the new order lands in is cold, and vice versa.
+	std::uint64_t order_slot_reuse_distance_ops = kNoPreviousSlotTouch;
 };
 
 // ------------------------------------------------------------------
@@ -170,6 +179,17 @@ public:
 
 		resting_orders_ = base_resting_orders;
 		book_ = build_book_from_tracking(pool, book_handles_);
+
+		// Order-pool-slot reuse distance is collected by an untimed dry-run replay
+		// of the finalized pending batch (see annotate_order_slot_reuse). It mutates
+		// the book, so we rebuild one final time for the timed run. The rebuild is
+		// deterministic, so the slot each add lands on during the timed replay is
+		// bit-identical to the slot observed during the dry run.
+		if constexpr (EnableAttribution) {
+			annotate_order_slot_reuse();
+			resting_orders_ = base_resting_orders;
+			book_ = build_book_from_tracking(pool, book_handles_);
+		}
 	}
 
 	bool Execute(std::size_t idx, std::uint64_t& ok) {
@@ -362,6 +382,51 @@ private:
 		if constexpr (!EnableAttribution) return;
 		last_level_touch(side)[price] =
 				static_cast<std::int64_t>(attribution_op_index_);
+	}
+
+	// Untimed dry-run: replay the finalized pending batch against a freshly built
+	// book (identical to the one the timed run will use), reading back the pool
+	// slot each resting add acquires. Distance is measured in ops since that slot
+	// was last acquired by a limit add. Every op is replayed (cancel/modify/market
+	// too) so the free-list evolves exactly as it will during the timed replay;
+	// only limit adds read a handle and record a distance.
+	void annotate_order_slot_reuse() {
+		if constexpr (!EnableAttribution) return;
+		std::unordered_map<matching::OrderHandle, std::int64_t> last_slot_acquire_op;
+		last_slot_acquire_op.reserve(pending_.size());
+
+		for (std::size_t i = 0; i < pending_.size(); ++i) {
+			const auto& op = pending_[i];
+			const std::int64_t current = static_cast<std::int64_t>(i);
+			switch (op.type) {
+			case PendingOp::kLimitAdd: {
+				const auto res =
+						book_->add_limit_order(op.oid, op.side, op.price, op.qty, op.oid);
+				// A resting add is the only case that acquires a durable slot.
+				if (res.code == matching::ErrorCode::Success &&
+						res.remaining_quantity > 0 &&
+						res.handle != matching::kInvalidHandle) {
+					const auto it = last_slot_acquire_op.find(res.handle);
+					pending_attribution_[i].order_slot_reuse_distance_ops =
+							(it == last_slot_acquire_op.end())
+									? kNoPreviousSlotTouch
+									: static_cast<std::uint64_t>(current - it->second);
+					last_slot_acquire_op[res.handle] = current;
+				}
+				break;
+			}
+			case PendingOp::kCancel:
+				(void)book_->cancel_order(op.target_handle);
+				break;
+			case PendingOp::kModify:
+				(void)book_->modify_order(op.target_handle, op.side, op.price, op.qty,
+																	op.oid);
+				break;
+			case PendingOp::kMarket:
+				(void)book_->add_market_order(op.oid, op.side, op.market_qty, op.oid);
+				break;
+			}
+		}
 	}
 
 	void set_shadow_level(matching::Side side, std::int64_t price) noexcept {

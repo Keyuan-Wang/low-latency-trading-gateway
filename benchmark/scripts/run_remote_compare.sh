@@ -39,7 +39,14 @@ REMOTE_ARTIFACTS_DIR="${REMOTE_ARTIFACTS_DIR:-$REMOTE_ROOT/artifacts}"
 REMOTE_TARBALL="${REMOTE_TARBALL:-$REMOTE_ROOT/bench_compare_artifacts.tgz}"
 
 # --- local output ---
-LOCAL_OUT_DIR="${LOCAL_OUT_DIR:-./server_results}"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+LOCAL_OUT_ROOT="${LOCAL_OUT_ROOT:-$ROOT_DIR/server_results}"
+LOCAL_OUT_ROOT="$(mkdir -p "$LOCAL_OUT_ROOT" && cd "$LOCAL_OUT_ROOT" && pwd)"
+LOCAL_ARCHIVES_DIR="$LOCAL_OUT_ROOT/archives"
+LOCAL_COMPARE_ROOT="$LOCAL_OUT_ROOT/compare"
+mkdir -p "$LOCAL_ARCHIVES_DIR" "$LOCAL_COMPARE_ROOT"
+# Legacy alias: LOCAL_OUT_DIR overrides the compare run directory when set.
+LOCAL_COMPARE_RUN_DIR="${LOCAL_OUT_DIR:-${LOCAL_COMPARE_RUN_DIR:-}}"
 
 # --- benchmark campaign params (applied to every version) ---
 SCENARIOS="${SCENARIOS:-hft_macro}"
@@ -113,7 +120,17 @@ SSH_OPTS=(-i "$SSH_KEY" -p "$SSH_PORT" -o StrictHostKeyChecking=accept-new)
 SCP_OPTS=(-i "$SSH_KEY" -P "$SSH_PORT" -o StrictHostKeyChecking=accept-new)
 
 STAMP="$(date +%Y%m%d_%H%M%S)"
-LOCAL_TARBALL="$LOCAL_OUT_DIR/bench_compare_${STAMP}.tgz"
+if [[ ${#COMMITS[@]} -eq 2 ]]; then
+	COMPARE_LABEL="${COMMITS[0]}_vs_${COMMITS[1]}"
+else
+	COMPARE_LABEL="$(IFS=_; echo "${TAGS[*]}")"
+fi
+COMPARE_LABEL="${COMPARE_LABEL//\//_}"
+COMPARE_LABEL="${COMPARE_LABEL//:/_}"
+if [[ -z "$LOCAL_COMPARE_RUN_DIR" ]]; then
+	LOCAL_COMPARE_RUN_DIR="$LOCAL_COMPARE_ROOT/compare_${COMPARE_LABEL}_trials${TRIALS}_${STAMP}"
+fi
+LOCAL_TARBALL="${LOCAL_TARBALL:-$LOCAL_ARCHIVES_DIR/bench_compare_${COMPARE_LABEL}_trials${TRIALS}_${STAMP}.tgz}"
 
 # ---------------------------------------------------------------------------
 # Remote execution
@@ -275,7 +292,15 @@ for ((idx=0; idx<N; idx++)); do
   echo ""
   echo "========== [$((idx+1))/$N]  $commit  (tag: $tag) =========="
 
-  git checkout "origin/$commit" 2>/dev/null || git checkout --detach "$commit"
+  git fetch origin "$commit"
+  if git show-ref --verify --quiet "refs/remotes/origin/$commit"; then
+    git reset --hard "origin/$commit"
+  elif git rev-parse --verify "$commit^{commit}" >/dev/null 2>&1; then
+    git reset --hard "$commit"
+  else
+    echo "ERROR: unknown ref: $commit" >&2
+    exit 1
+  fi
   sha="$(git rev-parse --short HEAD)"
   COMMIT_SHAS+=("$sha")
   echo "  commit = $sha"
@@ -407,31 +432,32 @@ if [[ "$BACKGROUND" == "1" ]]; then
   echo "Pipeline running in background on remote server."
   echo "When complete, download manually:"
   echo ""
-  echo "  mkdir -p $LOCAL_OUT_DIR"
-  echo "  scp ${SSH_USER}@${SERVER_IP}:${REMOTE_TARBALL} $LOCAL_OUT_DIR/"
-  echo "  tar -xzf $LOCAL_OUT_DIR/$(basename "$REMOTE_TARBALL") -C $LOCAL_OUT_DIR"
+  echo "  mkdir -p $(dirname "$LOCAL_TARBALL") $LOCAL_COMPARE_RUN_DIR"
+  echo "  scp ${SSH_USER}@${SERVER_IP}:${REMOTE_TARBALL} $(dirname "$LOCAL_TARBALL")/"
+  echo "  tar -xzf $LOCAL_TARBALL -C $LOCAL_COMPARE_RUN_DIR"
   echo ""
   echo "Key outputs after extraction:"
-  echo "  $LOCAL_OUT_DIR/repo/benchmark/results/compare_merged_agg.csv"
-  echo "  $LOCAL_OUT_DIR/repo/benchmark/results/plots/*.png"
+  echo "  $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/compare_merged_agg.csv"
+  echo "  $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/plots/*.png"
 else
   echo ""
   echo "[Download] Fetching artifacts from ${SSH_USER}@${SERVER_IP} ..."
-  mkdir -p "$LOCAL_OUT_DIR"
+  mkdir -p "$(dirname "$LOCAL_TARBALL")" "$LOCAL_COMPARE_RUN_DIR"
   scp "${SCP_OPTS[@]}" "${SSH_USER}@${SERVER_IP}:${REMOTE_TARBALL}" "$LOCAL_TARBALL"
 
   echo "[Extract] Unpacking locally ..."
-  tar -xzf "$LOCAL_TARBALL" -C "$LOCAL_OUT_DIR"
+  tar -xzf "$LOCAL_TARBALL" -C "$LOCAL_COMPARE_RUN_DIR" --no-same-owner --no-same-permissions 2>/dev/null \
+    || tar -xzf "$LOCAL_TARBALL" -C "$LOCAL_COMPARE_RUN_DIR"
 
   echo ""
   echo "Done."
   echo "  Tarball    : $LOCAL_TARBALL"
-  echo "  Extracted  : $LOCAL_OUT_DIR"
+  echo "  Compare dir: $LOCAL_COMPARE_RUN_DIR"
   echo ""
   echo "Key comparison outputs:"
-  echo "  Aggregated CSV   : $LOCAL_OUT_DIR/repo/benchmark/results/compare_merged_agg.csv"
-  echo "  Line charts      : $LOCAL_OUT_DIR/repo/benchmark/results/plots/*_vs_*.png"
-  echo "  Bar charts       : $LOCAL_OUT_DIR/repo/benchmark/results/plots/*_bar_vs_*.png"
-  echo "  Heatmaps         : $LOCAL_OUT_DIR/repo/benchmark/results/plots/*_pct_change_heatmap.png"
-  echo "  Logs             : $LOCAL_OUT_DIR/artifacts/*.log"
+  echo "  Aggregated CSV   : $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/compare_merged_agg.csv"
+  echo "  Line charts      : $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/plots/*_vs_*.png"
+  echo "  Bar charts       : $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/plots/*_bar_vs_*.png"
+  echo "  Heatmaps         : $LOCAL_COMPARE_RUN_DIR/repo/benchmark/results/plots/*_pct_change_heatmap.png"
+  echo "  Logs             : $LOCAL_COMPARE_RUN_DIR/artifacts/*.log"
 fi

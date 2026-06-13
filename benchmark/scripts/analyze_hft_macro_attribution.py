@@ -99,21 +99,35 @@ def main() -> int:
 	reuse = summarize(new, ["campaign", "reuse_bin"])
 	layout = summarize(new, ["campaign", "price_mod8"])
 
-	correlation_rows = []
-	for campaign, group in new.dropna(subset=["reuse_distance"]).groupby("campaign"):
-		x = np.log2(group["reuse_distance"].to_numpy(dtype=float) + 1.0)
-		for metric in ("cycles", "elapsed_ns"):
-			y = group[metric].to_numpy(dtype=float)
-			correlation_rows.append({
-				"campaign": campaign,
-				"metric": metric,
-				"samples": len(group),
-				"pearson_log2_reuse": float(np.corrcoef(x, y)[0, 1]),
-				"spearman_log2_reuse": float(
-					pd.Series(x).corr(pd.Series(y), method="spearman")
-				),
-			})
-	correlations = pd.DataFrame(correlation_rows)
+	def correlate(frame: pd.DataFrame, distance_col: str) -> pd.DataFrame:
+		rows = []
+		for campaign, group in frame.dropna(subset=[distance_col]).groupby("campaign"):
+			x = np.log2(group[distance_col].to_numpy(dtype=float) + 1.0)
+			for metric in ("cycles", "elapsed_ns"):
+				y = group[metric].to_numpy(dtype=float)
+				rows.append({
+					"campaign": campaign,
+					"metric": metric,
+					"samples": len(group),
+					"pearson_log2_reuse": float(np.corrcoef(x, y)[0, 1]),
+					"spearman_log2_reuse": float(
+						pd.Series(x).corr(pd.Series(y), method="spearman")
+					),
+				})
+		return pd.DataFrame(rows)
+
+	correlations = correlate(new, "reuse_distance")
+
+	# Order-pool-slot reuse distance: present only in CSVs produced after the
+	# slot-attribution instrumentation was added. Guarded so older runs still work.
+	has_slot = "order_slot_reuse_distance_ops" in new.columns
+	if has_slot:
+		new["slot_reuse_distance"] = new["order_slot_reuse_distance_ops"].where(
+			new["order_slot_reuse_distance_ops"] >= 0, np.nan
+		)
+		new["slot_reuse_bin"] = new["slot_reuse_distance"].map(reuse_bin)
+		slot_reuse = summarize(new, ["campaign", "slot_reuse_bin"])
+		slot_correlations = correlate(new, "slot_reuse_distance")
 
 	out_dir = args.out_dir or args.csv[0].parent
 	out_dir.mkdir(parents=True, exist_ok=True)
@@ -121,13 +135,23 @@ def main() -> int:
 	reuse.to_csv(out_dir / "attribution_reuse_distance.csv", index=False)
 	layout.to_csv(out_dir / "attribution_price_mod8.csv", index=False)
 	correlations.to_csv(out_dir / "attribution_correlations.csv", index=False)
+	if has_slot:
+		slot_reuse.to_csv(
+			out_dir / "attribution_order_slot_reuse.csv", index=False)
+		slot_correlations.to_csv(
+			out_dir / "attribution_order_slot_correlations.csv", index=False)
 
 	print("New-level latency by occupancy set path")
 	print(set_path[set_path["metric"] == "cycles"].to_string(index=False))
 	print("\nNew-level latency by PriceLevel reuse distance")
 	print(reuse[reuse["metric"] == "cycles"].to_string(index=False))
-	print("\nReuse-distance correlations")
+	print("\nPriceLevel reuse-distance correlations")
 	print(correlations.to_string(index=False))
+	if has_slot:
+		print("\nNew-level latency by order-pool-slot reuse distance")
+		print(slot_reuse[slot_reuse["metric"] == "cycles"].to_string(index=False))
+		print("\nOrder-pool-slot reuse-distance correlations")
+		print(slot_correlations.to_string(index=False))
 	return 0
 
 
