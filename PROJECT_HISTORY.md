@@ -14,6 +14,9 @@ The notes below are based on:
 - `report/phase5_macro_profiling_plan.md`
 - `report/phase7_hot_ring_cold_map_design.md`
 - `report/phase7_benchmark_results.md`
+- `report/phase8_fixed_array_design.md`
+- `report/phase8_array_side_book_results.md`
+- `report/phase9_per_scenario_benchmark.md`
 - `benchmark/results/campaign_20260601_1319/`
 - `benchmark/results/hft_macro_perf_record_cloud_20260601/`
 - `server_results/macro_op_profile_cloud_t1/`
@@ -22,6 +25,12 @@ The notes below are based on:
 - `server_results/compare_master_vs_phase6a_20260605_182321/`
 - `server_results/master_ring_size_sweep_trials30_20260605_185129/`
 - `server_results/compare_master_vs_phase7b_20260606_184425/`
+- `server_results/compare_master_vs_phase7c_newvm_20260610_172132/`
+- `server_results/compare_master_vs_phase8b_20260610_183431/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_002441/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_005335/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_014047/`
+- `server_results/nohz_full_setup_20260612_023844/`
 
 ## Phase 1: Correctness-First Baseline
 
@@ -640,18 +649,22 @@ Phase 6a closes the Phase 5 perf-record action item (“replace cancel-index has
 
 As of the current repository state:
 
-- **`phase6a`** branch tags the gateway/handle milestone; **`master`** has advanced to Phase 7
+- **`phase6a`** tags the gateway/handle milestone; the active architecture has advanced through Phase 8 and the benchmark framework through Phase 9
 - matching core: **no** `id_to_order_`; cancel/modify are handle-based; gateway owns id validation and id→handle mapping off the hot path
-- price-level storage on `master`: `CachedSideBook` with a 16-slot hot ring buffer plus cold `std::map`
-- `RingSize=16` is the current chosen configuration after a 30-trial sweep of 8/16/32/64
+- active price-level storage: `ArraySideBook<IsAsk>` with a direct-addressed 65536-level array and fixed three-level `OccupancyTree`
+- Phase 8b's lazy ghost cleanup remains active; the Phase 8c eager-retirement metadata experiment was rejected
 - intrusive per-operation HFT macro profiling (`LLMES_PROFILE_HFT_MACRO_OPS` / `LLMES_PROFILE_HFT_MACRO_OP_PMCS`) has been removed from benchmark code and scripts
 - the `add_rest` stage-profiling feature was added and then **removed** as a non-viable measurement method (probe overhead dwarfed the probed region)
-- window-isolated production `perf record` validated on post-handle `master` — see `server_results/hft_macro_perf_record_master_20260603_153306/`
+- the benchmark suite now builds the batched `hft_macro` benchmark and the diagnostic `hft_macro_scenarios` collector; the older legacy/HFT micro executables have been removed
+- per-scenario collection records every `add_rest_existing_level`, `add_rest_new_level`, and `cancel_order` sample to CSV using isolated workload replays
+- cloud measurement runs on Hetzner CCX23; `run_remote_compare.sh` now applies the tested CPU/NUMA/IRQ/workqueue/realtime tuning after boot-time isolation setup
+- `nohz_full` reduced benchmark-CPU softirqs by roughly an order of magnitude but did not improve p99, so Linux-system tuning is considered complete for this VM
 - ChunkPool benchmark artifacts are recorded but the design is not the active baseline
 - PMR price-level node pooling was tested after Phase 6a; it reduced cache misses but increased instruction count and regressed macro latency, so it is not the active direction
-- Phase 7 replaces the former `std::map` hot `get_or_create` path with O(1) ring indexing while preserving a cold ordered path for arbitrary prices
 - unified Phase 1–6 narrative: `report/phase_evolution_phase1_to_phase6.md`, CSV `server_results/hft_macro_cross_phase_summary_20260603.csv`
 - Phase 7 narrative and benchmark report: `report/phase7_hot_ring_cold_map_design.md`, `report/phase7_benchmark_results.md`
+- Phase 8 rationale and result: `report/phase8_fixed_array_design.md`, `report/phase8_array_side_book_results.md`
+- Phase 9 per-scenario and system-tuning report: `report/phase9_per_scenario_benchmark.md`
 
 ## Jun 2026 Unified `hft_macro` Campaign (Devalidated + Phase 6/7)
 
@@ -904,7 +917,178 @@ Phase 7 validates the Phase 6b+ hypothesis: the next useful lever after handle-b
 | Phase 7a | 23.2 | 43.1M | hot ring buffer + cold map |
 | Phase 7b | 21.2 | 47.3M | + PriceLevelPool |
 | Phase 7c | 19.3 | 51.7M | + header-only/always_inline short helpers |
+| Phase 8b | 17.2 | 58.1M | unified array side book + fixed occupancy tree |
 
-Phase 1 → Phase 7c: roughly `2170 -> 19.3 ns/op`, about a 112x throughput improvement on the headline macro workload. Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking.
+Phase 1 → Phase 8b: roughly `2170 -> 17.2 ns/op`, about a 124x throughput improvement on the headline macro workload. Phase 1–2a rows are O(N)-cancel bound and not comparable to 2b+ for ranking.
 
-The next step should be a fresh production profile on Phase 7c before choosing a Phase 8 target. The Phase 7b profile remains useful for broad shape, but its pool acquire/release/resolve costs are partially superseded by Phase 7c. The older Phase 6a profile is superseded because its `std::map get_or_create` bottleneck has been structurally replaced.
+The next step was a fresh production profile on Phase 7c before choosing a Phase 8 target. The Phase 7b profile remained useful for broad shape, but its pool acquire/release/resolve costs were partially superseded by Phase 7c. The older Phase 6a profile was superseded because its `std::map get_or_create` bottleneck had been structurally replaced.
+
+## Phase 8: Unified Array Side Book
+
+### Motivation
+
+The Phase 7 hot ring made near-best lookup cheap, but the side book still coupled two different data structures. The production profile showed that hot-ring lookup itself consumed only about 5.5% of cycles, while best-level removal and ring re-anchoring consumed comparable shares:
+
+- `erase_best`: about 4.37%
+- `reanchor_to`: about 4.65%
+
+This suggested that the next structural win was not a larger or more elaborate hot cache. It was removing the hot/cold boundary and using one direct-addressed representation for the benchmark's known price range.
+
+### Design
+
+Phase 8 replaced the Phase 7 `hot ring + cold map` side book with:
+
+```text
+ArraySideBook<IsAsk>
+├── fixed-range array of PriceLevel objects
+└── OccupancyTree bitmap hierarchy
+```
+
+The array provides direct price-to-index access. The occupancy tree summarizes non-empty price indices in 64-bit words, allowing next-best lookup without scanning every price slot. Bid/ask direction is encoded as a template parameter so side-specific traversal does not require a runtime branch.
+
+### Phase 8a: First Working Version
+
+Commit:
+
+```text
+81ab90488de2f6e2ebf4d7ab917c69e4f5711e70
+```
+
+Artifact:
+
+```text
+server_results/compare_master_vs_phase7c_trials50_20260608_210512/
+server_results/hft_macro_perf_record_master_20260608_201629/
+```
+
+Phase 8a validated the architecture but was performance-neutral against Phase 7c:
+
+| Metric | Phase 8a | Phase 7c |
+|---|---:|---:|
+| avg ns/op | 19.30 | 19.57 |
+| cycles/op | 70.3 | 71.0 |
+| instructions/op | 158.3 | 137.1 |
+| branch misses/op | 1.351 | 1.497 |
+| cache misses/op | 0.022 | 0.034 |
+
+The array improved CPI, branch behavior, and cache behavior, but added about 21 instructions/op. Perf attributed the excess work mainly to ghost-level cleanup on pure read paths and generic occupancy-tree operations.
+
+### Phase 8b: Fixed Occupancy Tree and Pure Read Paths
+
+Commit:
+
+```text
+71f1ee191fbe40ad67d69572ccbc01c825d98b99
+```
+
+Artifacts:
+
+```text
+server_results/compare_master_vs_phase7c_newvm_20260610_172132/
+server_results/hft_macro_perf_record_master_20260610_162529/
+```
+
+Phase 8b removed ghost cleanup from `empty()`, `best_price()`, and `best_level()`. It also fixed the occupancy tree to the known 65536-price range with `std::array` storage and unrolled the three-level set/clear/find operations.
+
+| Metric | Phase 8b | Phase 7c | Change |
+|---|---:|---:|---:|
+| avg ns/op | 17.21 | 19.27 | -10.7% |
+| cycles/op | 62.82 | 70.26 | -10.6% |
+| instructions/op | 130.05 | 137.13 | -5.2% |
+| branch misses/op | 1.229 | 1.496 | -17.8% |
+| cache misses/op | 0.0202 | 0.0333 | -39.3% |
+
+Phase 8b is the active performance baseline. It reaches about 58.1M macro operations/s on the comparable Hetzner CCX23 run.
+
+### Phase 8c: Eager Empty-Level Retirement (Rejected)
+
+Artifact:
+
+```text
+server_results/compare_master_vs_phase8b_20260610_183431/
+```
+
+Phase 8c tried to clear occupancy state immediately when cancel/modify removed the final order from a level. This required owner-side/index metadata and extra work on common mutation paths.
+
+| Metric | Phase 8c | Phase 8b | Change |
+|---|---:|---:|---:|
+| avg ns/op | 17.95 | 17.05 | +5.2% slower |
+| cycles/op | 65.93 | 62.39 | +3.54 cycles/op |
+| instructions/op | 139.55 | 130.05 | +9.50 instructions/op |
+
+The eager mechanism cost more than the lazy ghost cleanup it removed. Phase 8c was reverted conceptually and recorded as a negative result. Phase 8 stops at the Phase 8b design.
+
+## Phase 9: Per-Scenario Macro Benchmark and Linux Isolation
+
+### Motivation and Design
+
+The normal `hft_macro` benchmark remains the release-level metric. It measures a whole batch with one timing window, keeping instrumentation overhead amortized. Phase 9 added a diagnostic benchmark that preserves the same pre-generated macro workload but records every call for three basic single-operation scenarios:
+
+- `add_rest_existing_level`
+- `add_rest_new_level`
+- `cancel_order`
+
+Crossing limit orders and market orders are replayed but not timed because one submitted operation can contain many internal matches. Modify is omitted because it is semantically cancel plus add.
+
+To prevent one scenario's instrumentation from perturbing another, `focus=all` replays the deterministic workload separately for each measured scenario. The CSV records raw and overhead-adjusted cycles and elapsed nanoseconds for every measured call.
+
+### Initial Finding
+
+The first complete result contained 937,410 measured calls across 10 trials. It showed that:
+
+- `cancel_order` is extremely compact and stable;
+- adding to an existing level is also controlled;
+- `add_rest_new_level` is the dominant tail-latency source among the measured basic operations.
+
+This validated the existing/new-level split and identified the new-level activation path as the most useful future engine target.
+
+### Linux System-Level Tuning
+
+All final Phase 9 measurements were collected on a Hetzner Cloud CCX23 KVM VM with an AMD EPYC-Milan CPU. The tuning campaign progressively added:
+
+- fixed CPU and NUMA binding;
+- SMT-sibling-aware CPU selection;
+- performance governor where exposed;
+- background timer/service suppression;
+- IRQ affinity observation and migration;
+- workqueue cpumask migration;
+- realtime FIFO scheduling via `chrt -f 95`;
+- watchdog and RT-throttling changes;
+- `/dev/cpu_dma_latency` locking;
+- boot-time `nohz_full`, `rcu_nocbs`, `isolcpus`, `irqaffinity`, and `kthread_cpus`.
+
+The final boot configuration isolated CPU2-3 and kept housekeeping on CPU0-1. Verification recorded:
+
+```text
+nohz_full=2,3
+rcu_nocbs=2,3
+isolcpus=nohz,domain,managed_irq,2,3
+irqaffinity=0,1
+kthread_cpus=0,1
+```
+
+### Final Result
+
+The system tuning worked mechanically. On benchmark CPU2:
+
+| Stage | LOC | RCU | TIMER | SCHED | softirq total |
+|---|---:|---:|---:|---:|---:|
+| dynamic CPU + IRQ move | 15590 | 1239 | 635 | 380 | 2254 |
+| aggressive isolation | 15319 | 1332 | 639 | 368 | 2339 |
+| `nohz_full` | 4695 | 117 | 11 | 91 | 219 |
+
+Despite the large reduction in local timer and softirq activity, p99 did not improve materially:
+
+| Scenario | dynamic CPU + IRQ move | aggressive isolation | `nohz_full` |
+|---|---:|---:|---:|
+| `add_rest_existing_level` | 22 ns | 22 ns | 22 ns |
+| `add_rest_new_level` | 71 ns | 71 ns | 80 ns |
+| `cancel_order` | 21 ns | 21 ns | 21 ns |
+
+The p99 cycle values remained 44, 154, and 44 respectively across all three stages. A pinned `virtio5-request` IRQ remained on CPU2, but its frequency was too low to explain the stable p99 boundary.
+
+### Conclusion
+
+Phase 9 established a reusable per-scenario diagnostic framework and a reproducible cloud benchmark environment. It also produced a useful negative result: after ordinary IRQ, scheduler, workqueue, RCU, and periodic-tick noise were substantially reduced, p99 did not move.
+
+Linux-system tuning is therefore closed for the current environment. The next optimization target is matching-engine instruction count, especially the `add_rest_new_level` path. The standard batched `hft_macro` benchmark remains the final decision metric; per-scenario results are diagnostic because per-call timestamp collection is intrusive.
