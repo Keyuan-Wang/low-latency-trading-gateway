@@ -54,6 +54,12 @@ struct ScenarioSample {
 	matching::Side side = matching::Side::Buy;
 	std::int64_t price = 0;
 	std::uint64_t qty = 0;
+	benchmark_runner::hft::OccupancySetPath occupancy_set_path =
+			benchmark_runner::hft::OccupancySetPath::NotApplicable;
+	std::uint16_t occupancy_l1_popcount_before = 0;
+	std::uint8_t price_mod8 = 0;
+	std::uint64_t level_reuse_distance_ops =
+			benchmark_runner::hft::kNoPreviousLevelTouch;
 	std::uint64_t raw_cycles = 0;
 	std::uint64_t cycles = 0;
 	std::uint64_t raw_elapsed_ns = 0;
@@ -197,7 +203,7 @@ void ParseArgs(int argc, char** argv, ScenarioArgs& args) {
 
 void RunUntimedWarmup(const benchmark_runner::Args& args,
 											std::uint64_t iter_idx) {
-	benchmark_runner::hft::HftMacroWorkload workload;
+	benchmark_runner::hft::HftMacroWorkload<false> workload;
 	workload.Setup(args, iter_idx);
 	std::uint64_t ok = 0;
 	for (std::size_t i = 0; i < workload.size(); ++i) {
@@ -213,8 +219,11 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 										 bool record_composition,
 										 MeasurementOverhead timing_overhead,
 										 CampaignStats& stats) {
-	benchmark_runner::hft::HftMacroWorkload workload;
+	benchmark_runner::hft::HftMacroWorkload<true> workload;
 	workload.Setup(args, replay_iter_idx);
+	auto& focus_samples =
+			stats.samples[benchmark_runner::hft::ScenarioIndex(focus)];
+	const std::size_t attribution_begin = focus_samples.size();
 
 	std::uint64_t ok = 0;
 	for (std::size_t i = 0; i < workload.size(); ++i) {
@@ -241,16 +250,18 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 					(raw_elapsed > timing_overhead.elapsed_ns)
 							? (raw_elapsed - timing_overhead.elapsed_ns)
 							: 0;
-			auto& samples =
-					stats.samples[benchmark_runner::hft::ScenarioIndex(scenario)];
-			samples.push_back(ScenarioSample{
+			focus_samples.push_back(ScenarioSample{
 					measurement_iter,
 					replay_iter_idx,
 					static_cast<std::uint64_t>(i),
-					static_cast<std::uint64_t>(samples.size()),
+					static_cast<std::uint64_t>(focus_samples.size()),
 					op.side,
 					op.price,
 					op.qty,
+					benchmark_runner::hft::OccupancySetPath::NotApplicable,
+					0,
+					0,
+					benchmark_runner::hft::kNoPreviousLevelTouch,
 					raw,
 					adjusted,
 					raw_elapsed,
@@ -258,6 +269,19 @@ void RunMeasuredPass(const benchmark_runner::Args& args,
 		} else {
 			(void)workload.Execute(i, ok);
 		}
+	}
+
+	// Attribution is attached only after every timed operation has completed.
+	// The sidecar vector is therefore never read between measured calls.
+	for (std::size_t sample_idx = attribution_begin;
+			 sample_idx < focus_samples.size(); ++sample_idx) {
+		auto& sample = focus_samples[sample_idx];
+		const auto& attribution = workload.attribution(sample.op_index);
+		sample.occupancy_set_path = attribution.occupancy_set_path;
+		sample.occupancy_l1_popcount_before =
+				attribution.occupancy_l1_popcount_before;
+		sample.price_mod8 = attribution.price_mod8;
+		sample.level_reuse_distance_ops = attribution.level_reuse_distance_ops;
 	}
 
 	if (record_composition) stats.ok += ok;
@@ -341,7 +365,9 @@ void WriteCsvSamples(const ScenarioArgs& args,
 			args.base.out_csv,
 			"mode,scenario,op_type,version_tag,commit_sha,trial_id,orders,levels,"
 			"batch_size,warmup_iters,iters,seed,measurement_iter,replay_iter_idx,"
-			"op_index,scenario_call_index,side,price,qty,raw_cycles,cycles,"
+			"op_index,scenario_call_index,side,price,qty,occupancy_set_path,"
+			"occupancy_l1_popcount_before,price_mod8,level_reuse_distance_ops,"
+			"raw_cycles,cycles,"
 			"timing_overhead_cycles,raw_elapsed_ns,elapsed_ns,elapsed_overhead_ns");
 
 	std::ofstream f(args.base.out_csv, std::ios::app);
@@ -415,6 +441,20 @@ void WriteCsvSamples(const ScenarioArgs& args,
 				<< ","
 				<< sample.qty
 				<< ","
+				<< benchmark_runner::hft::OccupancySetPathName(
+						 sample.occupancy_set_path)
+				<< ","
+				<< sample.occupancy_l1_popcount_before
+				<< ","
+				<< static_cast<unsigned>(sample.price_mod8)
+				<< ",";
+			if (sample.level_reuse_distance_ops ==
+					benchmark_runner::hft::kNoPreviousLevelTouch) {
+				f << -1;
+			} else {
+				f << sample.level_reuse_distance_ops;
+			}
+			f << ","
 				<< sample.raw_cycles
 				<< ","
 				<< sample.cycles

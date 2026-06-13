@@ -49,7 +49,7 @@ public:
 	}
 
 private:
-	benchmark_runner::hft::HftMacroWorkload workload_;
+	benchmark_runner::hft::HftMacroWorkload<false> workload_;
 };
 
 }  // namespace

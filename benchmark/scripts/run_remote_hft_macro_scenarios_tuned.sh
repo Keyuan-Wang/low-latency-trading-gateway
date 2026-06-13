@@ -804,7 +804,7 @@ finalize_run() {
 	if [[ -n "${RESULTS_DIR:-}" && -f "$OUT_CSV" ]]; then
 		if [[ ! -f "$OUT_PNG" ]]; then
 			echo "--- Plot per-scenario distributions (finalize) ---"
-			CSV="$OUT_CSV" OUT="$OUT_PNG" \
+			CSV="$OUT_CSV" OUT="$OUT_PNG" TRIALS="" \
 				python benchmark/scripts/plot_hft_macro_scenarios.py \
 				| tee "$REMOTE_ARTIFACTS_DIR/plot_hft_macro_scenarios.log" || true
 		fi
@@ -877,9 +877,13 @@ cp "$RESULTS_DIR/kernel_activity_delta.txt" "$REMOTE_ARTIFACTS_DIR/kernel_activi
 restore_irqs
 snapshot_kernel restored "$RESULTS_DIR"
 
-CSV="$OUT_CSV" OUT="$OUT_PNG" \
+CSV="$OUT_CSV" OUT="$OUT_PNG" TRIALS="" \
 	python benchmark/scripts/plot_hft_macro_scenarios.py \
 	| tee "$REMOTE_ARTIFACTS_DIR/plot_hft_macro_scenarios.log" || true
+
+python benchmark/scripts/analyze_hft_macro_attribution.py \
+	"$OUT_CSV" --out-dir "$RESULTS_DIR" \
+	| tee "$REMOTE_ARTIFACTS_DIR/analyze_hft_macro_attribution.log" || true
 
 echo "[$(date -Iseconds)] writing env.txt and packaging ..."
 {
