@@ -12,6 +12,15 @@ if [[ "${1:-}" == "--dry-run" ]]; then
 fi
 
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+ENABLE_LTO="${ENABLE_LTO:-0}"
+BUILD_DIR="${BUILD_DIR:-}"
+if [[ -z "$BUILD_DIR" ]]; then
+	if [[ "$ENABLE_LTO" == "1" ]]; then
+		BUILD_DIR="$ROOT/build-lto"
+	else
+		BUILD_DIR="$ROOT/build"
+	fi
+fi
 TRIALS="${TRIALS:-10}"
 ITERS="${ITERS:-1}"
 WARMUP_ITERS="${WARMUP_ITERS:-1}"
@@ -25,17 +34,27 @@ COMMIT_SHA="${COMMIT_SHA:-unknown}"
 OUT_CSV="${OUT_CSV:-$OUT_DIR/hft_macro_scenario_calls.csv}"
 
 if (( DRY_RUN == 0 )); then
-	cmake -S "$ROOT" -B "$ROOT/build" \
+	CXX_FLAGS_RELEASE="-O3 -DNDEBUG"
+	LINK_FLAGS_RELEASE=""
+	if [[ "$ENABLE_LTO" == "1" ]]; then
+		CXX_FLAGS_RELEASE+=" -march=native -flto"
+		LINK_FLAGS_RELEASE="-flto"
+	fi
+	cmake -S "$ROOT" -B "$BUILD_DIR" \
 		-DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+		-DCMAKE_CXX_FLAGS_RELEASE="$CXX_FLAGS_RELEASE" \
+		-DCMAKE_EXE_LINKER_FLAGS_RELEASE="$LINK_FLAGS_RELEASE" \
 		-DLLMES_BUILD_BENCHMARKS=ON
-	cmake --build "$ROOT/build" -j
+	cmake --build "$BUILD_DIR" -j
 	: > "$OUT_CSV"
 fi
 
-BIN="$ROOT/build/benchmark/bench_hft_macro_scenarios"
+BIN="$BUILD_DIR/benchmark/bench_hft_macro_scenarios"
 
 echo "===== HFT macro per-scenario call data ====="
 echo "  trials      : $TRIALS"
+echo "  enable_lto  : $ENABLE_LTO"
+echo "  build_dir   : $BUILD_DIR"
 echo "  focus       : $FOCUS"
 echo "  batch_size  : $BATCH_SIZE"
 echo "  iters       : $ITERS"

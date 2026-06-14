@@ -37,6 +37,10 @@ BATCH_SIZE="${BATCH_SIZE:-100000}"
 SEED="${SEED:-42}"
 FOCUS="${FOCUS:-all}"
 VERSION_TAG="${VERSION_TAG:-tuned}"
+ENABLE_LTO="${ENABLE_LTO:-0}"
+BUILD_DIR="${BUILD_DIR:-}"
+SYNC_LOCAL_SCRIPTS="${SYNC_LOCAL_SCRIPTS:-1}"
+REMOTE_SYNC_TARBALL="${REMOTE_SYNC_TARBALL:-$REMOTE_ROOT/hft_macro_scenarios_scripts_sync.tgz}"
 
 BENCH_CPU="${BENCH_CPU:-auto}"
 NUMA_NODE="${NUMA_NODE:-auto}"
@@ -75,7 +79,18 @@ echo "  Checkout   : ${COMMIT_SHA:-$BRANCH}"
 echo "  Trials     : $TRIALS"
 echo "  Batch size : $BATCH_SIZE"
 echo "  Bench CPU  : $BENCH_CPU"
+echo "  LTO        : $ENABLE_LTO"
 echo ""
+
+if [[ "$SYNC_LOCAL_SCRIPTS" == "1" ]]; then
+	LOCAL_SYNC_TAR="$(mktemp /tmp/hft_scenarios_scripts_XXXXXX.tgz)"
+	tar czf "$LOCAL_SYNC_TAR" -C "$ROOT_DIR" \
+		benchmark/scripts/local/hft_macro_scenarios.sh
+	ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SERVER_IP}" "mkdir -p '$REMOTE_ROOT'"
+	scp "${SCP_OPTS[@]}" "$LOCAL_SYNC_TAR" "${SSH_USER}@${SERVER_IP}:${REMOTE_SYNC_TARBALL}"
+	rm -f "$LOCAL_SYNC_TAR"
+	echo "  Synced local scenario scripts to remote"
+fi
 
 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SERVER_IP}" \
 	"REPO_URL='$REPO_URL' BRANCH='$BRANCH' COMMIT_SHA='$COMMIT_SHA' \
@@ -91,7 +106,9 @@ ssh "${SSH_OPTS[@]}" "${SSH_USER}@${SERVER_IP}" \
 	AGGRESSIVE_ISOLATION='$AGGRESSIVE_ISOLATION' PIN_WORKQUEUES_AWAY='$PIN_WORKQUEUES_AWAY' \
 	STOP_IRQBALANCE='$STOP_IRQBALANCE' DISABLE_KERNEL_WATCHDOGS='$DISABLE_KERNEL_WATCHDOGS' \
 	LOCK_CPU_DMA_LATENCY='$LOCK_CPU_DMA_LATENCY' USE_CHRT_FIFO='$USE_CHRT_FIFO' \
-	REALTIME_PRIORITY='$REALTIME_PRIORITY' INSTALL_DEPS='$INSTALL_DEPS' bash -s" <<'ENDSSH'
+	REALTIME_PRIORITY='$REALTIME_PRIORITY' INSTALL_DEPS='$INSTALL_DEPS' \
+	ENABLE_LTO='$ENABLE_LTO' BUILD_DIR='$BUILD_DIR' \
+	REMOTE_SYNC_TARBALL='$REMOTE_SYNC_TARBALL' bash -s" <<'ENDSSH'
 set -euo pipefail
 
 mkdir -p "$REMOTE_ROOT" "$REMOTE_ARTIFACTS_DIR"
@@ -112,12 +129,26 @@ fi
 cd "$REMOTE_REPO_DIR"
 git fetch --all --prune --tags
 if [[ -n "$COMMIT_SHA" ]]; then
-	git checkout --detach "$COMMIT_SHA"
+	git fetch origin "$COMMIT_SHA" 2>/dev/null || true
+	if git show-ref --verify --quiet "refs/remotes/origin/$COMMIT_SHA"; then
+		git reset --hard "origin/$COMMIT_SHA"
+	elif git rev-parse --verify "$COMMIT_SHA^{commit}" >/dev/null 2>&1; then
+		git reset --hard "$COMMIT_SHA"
+	else
+		echo "ERROR: unknown ref: $COMMIT_SHA" >&2
+		exit 1
+	fi
 	CHECKOUT_DESC="commit $(git rev-parse HEAD) (detached)"
 else
 	git checkout "$BRANCH"
-	git pull --ff-only origin "$BRANCH"
+	git reset --hard "origin/$BRANCH"
 	CHECKOUT_DESC="branch $BRANCH @ $(git rev-parse HEAD)"
+fi
+
+if [[ -f "$REMOTE_SYNC_TARBALL" ]]; then
+	echo "--- Applying synced scenario scripts ---"
+	tar -xzf "$REMOTE_SYNC_TARBALL" -C "$REMOTE_REPO_DIR"
+	rm -f "$REMOTE_SYNC_TARBALL"
 fi
 
 python3 -m venv .venv
@@ -125,9 +156,27 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLMES_BUILD_BENCHMARKS=ON
-cmake --build build -j"$(nproc)"
-ctest --test-dir build --output-on-failure | tee "$REMOTE_ARTIFACTS_DIR/ctest.log"
+BUILD_DIR="${BUILD_DIR:-}"
+if [[ -z "$BUILD_DIR" ]]; then
+	if [[ "$ENABLE_LTO" == "1" ]]; then
+		BUILD_DIR="build-lto"
+	else
+		BUILD_DIR="build"
+	fi
+fi
+CXX_FLAGS_RELEASE="-O3 -DNDEBUG"
+LINK_FLAGS_RELEASE=""
+if [[ "$ENABLE_LTO" == "1" ]]; then
+	CXX_FLAGS_RELEASE+=" -march=native -flto"
+	LINK_FLAGS_RELEASE="-flto"
+fi
+cmake -S . -B "$BUILD_DIR" \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DCMAKE_CXX_FLAGS_RELEASE="$CXX_FLAGS_RELEASE" \
+	-DCMAKE_EXE_LINKER_FLAGS_RELEASE="$LINK_FLAGS_RELEASE" \
+	-DLLMES_BUILD_BENCHMARKS=ON
+cmake --build "$BUILD_DIR" -j"$(nproc)"
+ctest --test-dir "$BUILD_DIR" --output-on-failure | tee "$REMOTE_ARTIFACTS_DIR/ctest.log"
 
 RESULTS_DIR="$REMOTE_REPO_DIR/benchmark/results/hft_macro_scenarios_tuned_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$RESULTS_DIR"
@@ -867,6 +916,7 @@ env \
 	TRIALS="$TRIALS" ITERS="$ITERS" WARMUP_ITERS="$WARMUP_ITERS" \
 	ORDERS="$ORDERS" LEVELS="$LEVELS" BATCH_SIZE="$BATCH_SIZE" \
 	SEED="$SEED" FOCUS="$FOCUS" VERSION_TAG="$VERSION_TAG" \
+	ENABLE_LTO="$ENABLE_LTO" BUILD_DIR="$REMOTE_REPO_DIR/$BUILD_DIR" \
 	COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" OUT_DIR="$RESULTS_DIR" OUT_CSV="$OUT_CSV" \
 	"${RUN_PREFIX[@]}" bash benchmark/scripts/local/hft_macro_scenarios.sh \
 	| tee "$REMOTE_ARTIFACTS_DIR/run_hft_macro_scenarios_tuned.log"
@@ -900,6 +950,8 @@ echo "[$(date -Iseconds)] writing env.txt and packaging ..."
 	echo "iters=$ITERS"
 	echo "warmup_iters=$WARMUP_ITERS"
 	echo "version_tag=$VERSION_TAG"
+	echo "enable_lto=$ENABLE_LTO"
+	echo "build_dir=$BUILD_DIR"
 	echo
 	echo "===== tuning ====="
 	echo "bench_cpu=$BENCH_CPU_SELECTED"

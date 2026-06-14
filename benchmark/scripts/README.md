@@ -23,7 +23,6 @@ benchmark/scripts/
 | `benchmarks.sh` | Macro matrix: latency + PMC trials → raw CSVs |
 | `hft_macro_scenarios.sh` | Per-scenario call attribution CSV |
 | `hft_macro_perf_record.sh` | Window-isolated `perf record` + report/annotate |
-| `pgo_compare.sh` | GCC baseline / LTO / PGO matrix build + validation |
 
 Examples:
 
@@ -31,7 +30,6 @@ Examples:
 bash benchmark/scripts/local/benchmarks.sh
 ENABLE_LTO=1 EVENTS=cycles:u FREQ=2000 USE_CHRT_FIFO=0 \
   bash benchmark/scripts/local/hft_macro_perf_record.sh
-bash benchmark/scripts/local/pgo_compare.sh --trials 50
 ```
 
 ## `remote/` — cloud runners
@@ -44,7 +42,6 @@ Each script clones/pulls the repo on the server, runs the matching `local/` driv
 | `compare.sh` | Two-branch/commit A/B comparison |
 | `hft_macro_scenarios_tuned.sh` | Per-scenario attribution with Linux isolation |
 | `hft_macro_perf_record.sh` | Remote perf record (optional `SYNC_LOCAL_SCRIPTS=1`) |
-| `pgo_compare.sh` | Remote PGO/LTO matrix |
 | `ring_size_sweep.sh` | RingSize parameter sweep |
 | `setup_nohz_full.sh` | One-time boot `nohz_full` + CPU isolation |
 
