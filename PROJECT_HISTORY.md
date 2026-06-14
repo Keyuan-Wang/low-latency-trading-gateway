@@ -17,6 +17,8 @@ The notes below are based on:
 - `report/phase8_fixed_array_design.md`
 - `report/phase8_array_side_book_results.md`
 - `report/phase9_per_scenario_benchmark.md`
+- `report/phase10_progress.md`
+- `report/phase11_lto_pgo_results.md`
 - `benchmark/results/campaign_20260601_1319/`
 - `benchmark/results/hft_macro_perf_record_cloud_20260601/`
 - `server_results/macro_op_profile_cloud_t1/`
@@ -31,6 +33,11 @@ The notes below are based on:
 - `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_005335/`
 - `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260612_014047/`
 - `server_results/nohz_full_setup_20260612_023844/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260613_162525/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260613_193319/`
+- `server_results/hft_macro/pgo_compare/pgo_compare_20260614_113205/`
+- `server_results/hft_macro/perf_record/hft_macro_perf_record_20260614_115103/`
+- `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260614_120210/`
 
 ## Phase 1: Correctness-First Baseline
 
@@ -647,24 +654,31 @@ Phase 6a closes the Phase 5 perf-record action item (“replace cancel-index has
 
 ## Current Status
 
-As of the current repository state:
+As of the Phase 11 endpoint:
 
-- **`phase6a`** tags the gateway/handle milestone; the active architecture has advanced through Phase 8 and the benchmark framework through Phase 9
+- **`phase6a`** tags the gateway/handle milestone; the active architecture and benchmark campaign have advanced through Phase 11
 - matching core: **no** `id_to_order_`; cancel/modify are handle-based; gateway owns id validation and id→handle mapping off the hot path
-- active price-level storage: `ArraySideBook<IsAsk>` with a direct-addressed 65536-level array and fixed three-level `OccupancyTree`
+- active price-level storage: `ArraySideBook<IsAsk>` with 4096 direct-addressed levels per side and a fixed two-level `OccupancyTree`
+- `PriceLevel` is 16 bytes; orders remain pool-backed and linked intrusively within each price level
 - Phase 8b's lazy ghost cleanup remains active; the Phase 8c eager-retirement metadata experiment was rejected
 - intrusive per-operation HFT macro profiling (`LLMES_PROFILE_HFT_MACRO_OPS` / `LLMES_PROFILE_HFT_MACRO_OP_PMCS`) has been removed from benchmark code and scripts
 - the `add_rest` stage-profiling feature was added and then **removed** as a non-viable measurement method (probe overhead dwarfed the probed region)
 - the benchmark suite now builds the batched `hft_macro` benchmark and the diagnostic `hft_macro_scenarios` collector; the older legacy/HFT micro executables have been removed
 - per-scenario collection records every `add_rest_existing_level`, `add_rest_new_level`, and `cancel_order` sample to CSV using isolated workload replays
-- cloud measurement runs on Hetzner CCX23; `run_remote_compare.sh` now applies the tested CPU/NUMA/IRQ/workqueue/realtime tuning after boot-time isolation setup
+- cloud measurement runs on Hetzner CCX23; `benchmark/scripts/remote/compare.sh` applies the tested CPU/NUMA/IRQ/workqueue/realtime tuning after boot-time isolation setup
 - `nohz_full` reduced benchmark-CPU softirqs by roughly an order of magnitude but did not improve p99, so Linux-system tuning is considered complete for this VM
+- Phase 10 rejected PriceLevel and order-slot cache reuse as explanations for the common `add_rest_new_level` p99/p999 tail; per-call timing remains diagnostic only
+- Phase 11 selected LTO as the performance Release configuration: 15.630 ns/op, 63.99M ops/s, and 94.81 instructions/op across the 50-seed comparison
+- PGO and LTO+PGO did not beat LTO alone; PGO benchmark support was removed
+- the matching-engine and order-book core is frozen; future work moves to SPSC event transport, thread ownership, networking, and persistence
 - ChunkPool benchmark artifacts are recorded but the design is not the active baseline
 - PMR price-level node pooling was tested after Phase 6a; it reduced cache misses but increased instruction count and regressed macro latency, so it is not the active direction
 - unified Phase 1–6 narrative: `report/phase_evolution_phase1_to_phase6.md`, CSV `server_results/hft_macro_cross_phase_summary_20260603.csv`
 - Phase 7 narrative and benchmark report: `report/phase7_hot_ring_cold_map_design.md`, `report/phase7_benchmark_results.md`
 - Phase 8 rationale and result: `report/phase8_fixed_array_design.md`, `report/phase8_array_side_book_results.md`
 - Phase 9 per-scenario and system-tuning report: `report/phase9_per_scenario_benchmark.md`
+- Phase 10 attribution report: `report/phase10_progress.md`
+- Phase 11 compiler-optimization report: `report/phase11_lto_pgo_results.md`
 
 ## Jun 2026 Unified `hft_macro` Campaign (Devalidated + Phase 6/7)
 
@@ -1092,3 +1106,118 @@ The p99 cycle values remained 44, 154, and 44 respectively across all three stag
 Phase 9 established a reusable per-scenario diagnostic framework and a reproducible cloud benchmark environment. It also produced a useful negative result: after ordinary IRQ, scheduler, workqueue, RCU, and periodic-tick noise were substantially reduced, p99 did not move.
 
 Linux-system tuning is therefore closed for the current environment. The next optimization target is matching-engine instruction count, especially the `add_rest_new_level` path. The standard batched `hft_macro` benchmark remains the final decision metric; per-scenario results are diagnostic because per-call timestamp collection is intrusive.
+
+## Phase 10: New-Level Tail Attribution
+
+### Goal
+
+Phase 10 investigated why `add_rest_new_level` had a much larger tail than adding to an existing level. The working hypotheses were occupancy-tree propagation, PriceLevel cache reuse, and order-pool slot reuse.
+
+The benchmark generator was first fixed so every trial used a different deterministic random stream. Earlier multi-trial scenario runs had largely repeated the same workload.
+
+### Occupancy-Tree Paths
+
+The scenario benchmark attributed each new-level add to the exact work performed by `OccupancyTree::set()`.
+
+| Bitmap path | Share | p50 cycles | p99 cycles | p999 cycles |
+|---|---:|---:|---:|---:|
+| Target bit already set | 63.7% | 44 | 66 | 110 |
+| L1 only | 33.1% | 44 | 198 | 308 |
+| Reached L2 | 2.0% | 88 | 330 | 550 |
+| Reached L3 | 1.2% | 44 | 264 | 738 |
+
+Upper-level propagation is visibly more expensive, but it is too rare to explain the whole common tail. Large outliers also appeared on the cheapest path.
+
+### Layout and Cache Tests
+
+`PriceLevel::size_` was unused and removed, reducing `PriceLevel` from 24 to 16 bytes. Four levels now fit in one 64-byte cache line.
+
+Two reuse-distance studies then tested the cache hypothesis directly:
+
+| Measured object | Spearman correlation with cycles | Conclusion |
+|---|---:|---|
+| PriceLevel | 0.107 | Weak relationship |
+| Order-pool slot | 0.010 | No useful relationship |
+
+First-touch samples were expensive, but rare. About 97% of acquired order slots had been used within the previous 100 operations because the pool's LIFO free list rapidly recycles a small hot set.
+
+Manual PriceLevel prefetch was also tested. It did not produce a reliable end-to-end gain and sometimes worsened cancel tail latency, so no prefetch remains on the active order path.
+
+### Smaller Price Range
+
+The configured side-book range was reduced from 65536 to 4096 prices, removing the third bitmap level and reducing PriceLevel storage per side from 1 MiB to 64 KiB.
+
+| Metric | 4096 levels | 65536 levels | Change |
+|---|---:|---:|---:|
+| Average ns/op | 18.099 | 17.953 | +0.8% |
+| Cycles/op | 66.161 | 65.763 | +0.6% |
+| Instructions/op | 128.494 | 130.049 | -1.2% |
+| Cache misses/op | 0.02099 | 0.02198 | -4.5% |
+
+The smaller structure was kept because it uses less memory and has a simpler two-level tree, not because it improved macro latency. The active benchmark touches only about 100 nearby prices, so both allocations already have a small hot working set.
+
+### Conclusion
+
+Phase 10 closed the `add_rest_new_level` p99/p999 investigation. Bitmap work changes the distribution, but neither PriceLevel reuse nor order-slot reuse explains the common tail. Per-call timestamp measurements are too intrusive and quantized to justify further optimization around their percentiles.
+
+Future decisions return to the batched macro metrics: average ns/op, cycles/op, and instructions/op.
+
+## Phase 11: LTO, PGO, and Matching-Core Freeze
+
+### Build Matrix
+
+Phase 11 tested four GCC 15 Release configurations on Hetzner CCX23:
+
+1. Baseline: `-O3 -DNDEBUG -march=native`
+2. LTO
+3. PGO
+4. LTO + PGO
+
+PGO used 10 training seeds. Validation used 50 different seeds, with the four modes rotated in execution order for each paired trial.
+
+Primary artifact:
+
+```text
+server_results/hft_macro/pgo_compare/pgo_compare_20260614_113205/
+```
+
+### Result
+
+| Build | Average ns/op | Throughput | Cycles/op | Instructions/op | Branches/op |
+|---|---:|---:|---:|---:|---:|
+| Baseline | 17.589 | 56.86M | 64.62 | 127.67 | 25.06 |
+| **LTO** | **15.630** | **63.99M** | **57.25** | **94.81** | **17.07** |
+| LTO + PGO | 15.790 | 63.34M | 58.03 | 93.93 | 16.04 |
+| PGO | 17.815 | 56.14M | 65.58 | 122.70 | 21.79 |
+
+LTO reduced average latency by 11.1%, cycles by 11.4%, instructions by 25.7%, and branches by 31.9%. It beat baseline on all 50 paired validation seeds. Text size also fell from 95,810 to 83,491 bytes.
+
+The win came from executing less code across translation-unit boundaries. CPI increased from 0.506 to 0.604 and branch misses stayed almost flat, so this was not a cache or branch-prediction improvement.
+
+PGO alone was 1.3% slower than baseline. LTO+PGO was 1.0% slower than LTO despite executing slightly fewer instructions. Both configurations were rejected, and PGO-specific benchmark code and scripts were removed.
+
+### Profiling and Scenario Checks
+
+The zero-loss LTO `perf record` run captured 1320 samples. It remained useful for broad hotspot discovery, but cross-translation-unit inlining folded much of the engine into callers, making small function-level percentages unreliable.
+
+Per-scenario cycle percentiles were unchanged by LTO:
+
+| Scenario | p50 | p99 | p999 |
+|---|---:|---:|---:|
+| Existing-level add | 22 | 44 | 66 |
+| New-level add | 44 | 176 | 286 |
+| Cancel | 22 | 44 | 44 |
+
+This does not conflict with the macro improvement. Per-call `rdtscp` measurement quantizes results into roughly 22-cycle steps and hides small changes inside an individual operation. LTO primarily optimized dispatch, calls, result handling, and surrounding executable-level work.
+
+### Final Decision
+
+LTO is the final performance Release configuration. PGO is not retained.
+
+The matching-engine and order-book core is now considered complete for this project stage. Further assembly-level tuning would cost more time than the remaining gains justify. The next work moves to the system around the core:
+
+- SPSC event and trade transport;
+- single-owner matching-thread integration;
+- network input/output;
+- journal and recovery;
+- execution and risk components.
