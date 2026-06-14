@@ -38,8 +38,7 @@ Each script clones/pulls the repo on the server, runs the matching `local/` driv
 
 | Script | Purpose |
 |---|---|
-| `bench.sh` | Full benchmark + merge + plots |
-| `compare.sh` | Two-branch/commit A/B comparison |
+| `compare.sh` | N-way branch/commit comparison (use `VERSIONS="master:baseline"` for a single run) |
 | `hft_macro_scenarios_tuned.sh` | Per-scenario attribution with Linux isolation |
 | `hft_macro_perf_record.sh` | Remote perf record (optional `SYNC_LOCAL_SCRIPTS=1`) |
 | `ring_size_sweep.sh` | RingSize parameter sweep |
@@ -48,7 +47,14 @@ Each script clones/pulls the repo on the server, runs the matching `local/` driv
 Examples:
 
 ```bash
+# Single-branch benchmark (replaces the old bench.sh)
 SERVER_IP=1.2.3.4 REPO_URL=https://github.com/you/llmes.git \
+  VERSIONS="master:baseline" TRIALS=10 \
+  bash benchmark/scripts/remote/compare.sh
+
+# Two-branch A/B comparison
+SERVER_IP=1.2.3.4 REPO_URL=https://github.com/you/llmes.git \
+  VERSIONS="master:new,phase9:old" \
   bash benchmark/scripts/remote/compare.sh
 
 SERVER_IP=1.2.3.4 REPO_URL=... ENABLE_LTO=1 USE_CHRT_FIFO=0 \
