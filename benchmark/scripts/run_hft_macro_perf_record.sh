@@ -53,8 +53,30 @@ ANNOTATE_SYMBOLS="${ANNOTATE_SYMBOLS:-add_limit_order cancel_order modify_order 
 VERSION_TAG="${VERSION_TAG:-perf_record}"
 COMMIT_SHA="${COMMIT_SHA:-$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)}"
 
+# Linux system-level benchmark isolation (matches run_remote_hft_macro_scenarios_tuned.sh).
+ENABLE_LINUX_ISOLATION="${ENABLE_LINUX_ISOLATION:-1}"
+BENCH_CPU="${BENCH_CPU:-auto}"
+NUMA_NODE="${NUMA_NODE:-auto}"
+CPU_PROBE_SECONDS="${CPU_PROBE_SECONDS:-2}"
+USE_NUMACTL="${USE_NUMACTL:-1}"
+SET_PERFORMANCE_GOVERNOR="${SET_PERFORMANCE_GOVERNOR:-1}"
+RESTORE_GOVERNOR="${RESTORE_GOVERNOR:-0}"
+REDUCE_BACKGROUND_NOISE="${REDUCE_BACKGROUND_NOISE:-1}"
+STOP_NOISY_TIMERS="${STOP_NOISY_TIMERS:-1}"
+AVOID_IRQ_ON_BENCH_CPU="${AVOID_IRQ_ON_BENCH_CPU:-1}"
+AVOID_IRQ_ON_SMT_SIBLINGS="${AVOID_IRQ_ON_SMT_SIBLINGS:-1}"
+RESTORE_IRQ_AFFINITY="${RESTORE_IRQ_AFFINITY:-0}"
+AGGRESSIVE_ISOLATION="${AGGRESSIVE_ISOLATION:-1}"
+PIN_WORKQUEUES_AWAY="${PIN_WORKQUEUES_AWAY:-1}"
+STOP_IRQBALANCE="${STOP_IRQBALANCE:-1}"
+DISABLE_KERNEL_WATCHDOGS="${DISABLE_KERNEL_WATCHDOGS:-1}"
+LOCK_CPU_DMA_LATENCY="${LOCK_CPU_DMA_LATENCY:-1}"
+USE_CHRT_FIFO="${USE_CHRT_FIFO:-1}"
+REALTIME_PRIORITY="${REALTIME_PRIORITY:-95}"
+
 BIN="$BUILD_DIR/benchmark/bench_hft_macro"
 PERF_DATA="$OUT_DIR/perf.data"
+ISOLATION_LIB="$ROOT/benchmark/scripts/lib/bench_linux_isolation.sh"
 
 # --- Preflight ---
 if ! command -v perf >/dev/null 2>&1; then
@@ -72,6 +94,24 @@ if [[ -r "$paranoid_file" ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
+
+RUN_PREFIX=()
+if [[ "$ENABLE_LINUX_ISOLATION" == "1" ]]; then
+	if [[ ! -f "$ISOLATION_LIB" ]]; then
+		echo "ERROR: isolation library not found: $ISOLATION_LIB" >&2
+		exit 1
+	fi
+	# shellcheck source=/dev/null
+	source "$ISOLATION_LIB"
+	bench_linux_isolation_begin "$OUT_DIR"
+	RUN_PREFIX=("${BENCH_LINUX_RUN_PREFIX[@]}")
+fi
+
+isolation_cleanup() {
+	if [[ "$ENABLE_LINUX_ISOLATION" == "1" ]] && declare -F bench_linux_isolation_end >/dev/null; then
+		bench_linux_isolation_end || true
+	fi
+}
 
 # --- Build a dedicated profiling binary: Release + -g, NO profiling macros ---
 # A separate build dir avoids clobbering the production Release build and
@@ -96,6 +136,7 @@ ACK_FIFO="$FIFO_DIR/perf_ack"
 mkfifo "$CTL_FIFO" "$ACK_FIFO"
 
 cleanup() {
+	isolation_cleanup
 	rm -rf "$FIFO_DIR"
 }
 trap cleanup EXIT
@@ -107,13 +148,16 @@ echo "  orders/levels: $ORDERS / $LEVELS"
 echo "  batch/iters  : $BATCH_SIZE / $ITERS  (warmup=$WARMUP_ITERS)"
 echo "  out dir      : $OUT_DIR"
 echo "  perf.data    : $PERF_DATA"
+if [[ "$ENABLE_LINUX_ISOLATION" == "1" ]]; then
+	echo "  isolation    : enabled (bench_cpu=${BENCH_CPU_SELECTED:-pending})"
+fi
 
 # `-D -1` starts with events disabled; the runner sends 'enable' via the
 # control FIFO only around the RunOp batch. Env vars hand the FIFO paths to
 # the child (inherited through perf).
 LLMES_PERF_CTL_FIFO="$CTL_FIFO" \
 LLMES_PERF_ACK_FIFO="$ACK_FIFO" \
-perf record \
+"${RUN_PREFIX[@]}" perf record \
 	-o "$PERF_DATA" \
 	--control=fifo:"$CTL_FIFO","$ACK_FIFO" \
 	-D -1 \
@@ -169,7 +213,11 @@ done
 	echo "iters         : $ITERS"
 	echo "seed          : $SEED"
 	echo "window        : RunOp batch only (perf --control=fifo, -D -1)"
+	echo "linux_isolation: $ENABLE_LINUX_ISOLATION"
 } > "$OUT_DIR/meta.txt"
+if [[ "$ENABLE_LINUX_ISOLATION" == "1" ]] && declare -F bench_linux_isolation_write_env >/dev/null; then
+	bench_linux_isolation_write_env "$OUT_DIR/meta.txt"
+fi
 
 echo "done:"
 echo "  report   : $OUT_DIR/report.txt"
