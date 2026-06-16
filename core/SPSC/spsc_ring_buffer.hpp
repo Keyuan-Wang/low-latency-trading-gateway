@@ -1,64 +1,49 @@
-#include <vector>
+#include <mutex>
+#include <array>
+#include <optional>
 
-template <typename T>
-class RingBuffer {
+template <typename T, std::size_t Capacity>
+class MutexRingBuffer {
 public:
-    explicit RingBuffer(std::size_t capacity)
-    : capacity_(capacity + 1)
-    , buffer_(capacity)
-    , read_pos_(0)
-    , write_pos_(0) {};
+    static_assert(Capacity >= 2);
 
-    // try to put an element, if full then return false
-    // if you want to keep u, pass it in directly
-    // if you want to move u to the buffer, use std::move()
-    template <typename U>
-    bool push(U&& item) {
-        // the move operation of T must be noexcept
-        static_assert(std::is_nothrow_move_assignable_v<T> || !std::is_move_assignable_v<T>,
-            "T must have a noexcept move assign operator or no move assign");
+    bool push(const T& value) {
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        // find the pos of next empty slot
-        std::size_t next = (write_pos_ + 1) % capacity_;
+        const std::size_t next_ = increment(head_);
 
-        if (next == read_pos_) {
-            return false;   // full
-        }
+        if (next_ == tail_)     return false;   // full
 
-        buffer_[write_pos_] = std::forward<U>(item);
-
-        write_pos_ = next;
+        buffer_[head_] = value;
+        head_ = next_;
         return true;
     }
 
-    // try to pop an element, if empty thrn return false
-    bool pop(T& item) {
-        if (read_pos_ == write_pos_) {
-            return false;   // empty
-        }
 
-        item = buffer_[read_pos_];
+    std::optional<T> pop() {
+        std::lock_guard<std::mutex> lock(mutex_);
 
-        read_pos_ = (read_pos_ + 1) % capacity_;
+        if (head_ == tail_)     return std::nullopt;   // empty
 
-        return true;
+        const T value = buffer_[tail_];
+
+        tail_ = increment(tail_);
+
+        return value;
     }
+    
+    bool empty() const { return tail_ == head_; }
 
-    bool empty() const { return read_pos_ == write_pos_; }
-
-    bool full() const { return (write_pos_ + 1) % capacity_ == read_pos_; }
-
-    std::size_t size() const {
-        if (write_pos_ >= read_pos_)
-            return write_pos_ - read_pos_;
-        return capacity_ - read_pos_ + write_pos_;
-    }
-
-    std::size_t capacity() const { return capacity_ - 1; }
+    bool full() const { return increment(head_) == tail_; }
 
 private:
-    std::size_t capacity_;
-    std::vector<T> buffer_;
-    std::size_t read_pos_ = 0;
-    std::size_t write_pos_ = 0;
+    static constexpr std::size_t increment(std::size_t index) {
+        return (index + 1) % Capacity;
+    }
+
+
+    std::array<T, Capacity> buffer_{};
+    std::size_t tail_ = 0;
+    std::size_t head_ = 0;
+    std::mutex mutex_;
 };
