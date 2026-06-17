@@ -19,6 +19,7 @@ The notes below are based on:
 - `report/phase9_per_scenario_benchmark.md`
 - `report/phase10_progress.md`
 - `report/phase11_lto_pgo_results.md`
+- `report/spsc_cloud_benchmark_20260617.md`
 - `benchmark/results/campaign_20260601_1319/`
 - `benchmark/results/hft_macro_perf_record_cloud_20260601/`
 - `server_results/macro_op_profile_cloud_t1/`
@@ -38,6 +39,8 @@ The notes below are based on:
 - `server_results/hft_macro/pgo_compare/pgo_compare_20260614_113205/`
 - `server_results/hft_macro/perf_record/hft_macro_perf_record_20260614_115103/`
 - `server_results/hft_macro/scenarios_tuned/hft_macro_scenarios_tuned_20260614_120210/`
+- `server_results/spsc_full_20260617/`
+- `server_results/spsc_opt_compare_20260617/`
 
 ## Phase 1: Correctness-First Baseline
 
@@ -654,7 +657,7 @@ Phase 6a closes the Phase 5 perf-record action item (“replace cancel-index has
 
 ## Current Status
 
-As of the Phase 11 endpoint:
+As of the SPSC queue milestone after Phase 11:
 
 - **`phase6a`** tags the gateway/handle milestone; the active architecture and benchmark campaign have advanced through Phase 11
 - matching core: **no** `id_to_order_`; cancel/modify are handle-based; gateway owns id validation and id→handle mapping off the hot path
@@ -670,7 +673,9 @@ As of the Phase 11 endpoint:
 - Phase 10 rejected PriceLevel and order-slot cache reuse as explanations for the common `add_rest_new_level` p99/p999 tail; per-call timing remains diagnostic only
 - Phase 11 selected LTO as the performance Release configuration: 15.630 ns/op, 63.99M ops/s, and 94.81 instructions/op across the 50-seed comparison
 - PGO and LTO+PGO did not beat LTO alone; PGO benchmark support was removed
-- the matching-engine and order-book core is frozen; future work moves to SPSC event transport, thread ownership, networking, and persistence
+- the matching-engine and order-book core is frozen
+- SPSC queue work has started the system-integration track; `SpscRingBufferAtomicV3` is the current recommended queue variant at 4.35 ns/msg and 230 Mmsg/s
+- next work moves to a fixed-size binary order-entry protocol, nonblocking TCP/epoll sessions, gateway-side id ownership, matching-thread integration, networking, and persistence
 - ChunkPool benchmark artifacts are recorded but the design is not the active baseline
 - PMR price-level node pooling was tested after Phase 6a; it reduced cache misses but increased instruction count and regressed macro latency, so it is not the active direction
 - unified Phase 1–6 narrative: `report/phase_evolution_phase1_to_phase6.md`, CSV `server_results/hft_macro_cross_phase_summary_20260603.csv`
@@ -679,6 +684,7 @@ As of the Phase 11 endpoint:
 - Phase 9 per-scenario and system-tuning report: `report/phase9_per_scenario_benchmark.md`
 - Phase 10 attribution report: `report/phase10_progress.md`
 - Phase 11 compiler-optimization report: `report/phase11_lto_pgo_results.md`
+- SPSC queue benchmark report: `report/spsc_cloud_benchmark_20260617.md`
 
 ## Jun 2026 Unified `hft_macro` Campaign (Devalidated + Phase 6/7)
 
@@ -1221,3 +1227,119 @@ The matching-engine and order-book core is now considered complete for this proj
 - network input/output;
 - journal and recovery;
 - execution and risk components.
+
+## Phase 12a: SPSC Lock-Free Ring Buffer
+
+### Motivation
+
+After Phase 11, the matching engine and order book were frozen. The next bottleneck is no longer inside the book; it is the boundary around it.
+
+The intended runtime model is:
+
+- one gateway/session thread handles network I/O and protocol parsing;
+- one matching thread owns `OrderBook`;
+- commands flow from gateway to matching through an SPSC queue;
+- execution reports and trades flow back through another SPSC queue.
+
+That requires a queue whose overhead is small relative to the 15.63 ns/op matching-core baseline. A mutex queue is not acceptable on this path.
+
+### Implementation Ladder
+
+The SPSC implementation lives in:
+
+```text
+core/SPSC/spsc_ring_buffer.hpp
+core/SPSC/test.cpp
+```
+
+The source intentionally keeps several versions as an optimization ladder:
+
+| Step | CLI mode | Class | Design |
+|:---:|---|---|---|
+| 0 | `mutex` | `SpscRingBufferMutex` | `std::mutex` baseline |
+| 1 | `atomicv1` | `SpscRingBufferAtomicV1` | lock-free atomics, default `seq_cst`, no padding |
+| 2 | `atomicv2` | `SpscRingBufferAtomicV2` | cache-line padding + relaxed/acquire/release |
+| 3 | `atomicv3` | `SpscRingBufferAtomicV3` | cached opponent head/tail with modulo indices |
+| 4 | `atomicv4` | `SpscRingBufferAtomicV4` | cached local monotonic counters |
+
+All versions use a power-of-two ring capacity and mask-based indexing. The benchmark uses one producer thread and one consumer thread. The checksum validates that all messages are transferred exactly once.
+
+### Cloud Benchmark
+
+Primary artifacts:
+
+```text
+report/spsc_cloud_benchmark_20260617.md
+server_results/spsc_full_20260617/
+server_results/spsc_opt_compare_20260617/
+```
+
+Configuration:
+
+| Field | Value |
+|---|---|
+| Host | Hetzner, AMD EPYC-Milan, 4 vCPU, KVM |
+| Compiler | `g++ -O3 -std=c++20 -pthread` |
+| CPU affinity | `taskset -c 2,3` |
+| Messages | 50,000,000 |
+| Ring capacity | 1024 |
+| PMC | `perf stat -r 5 -d` |
+
+Latency result:
+
+| Step | Mode | ns/msg | Mmsg/s | Checksum |
+|:---:|---|---:|---:|---|
+| 0 | mutex | 98.3 | 10.2 | ok |
+| 1 | atomicv1 | 36.0 | 27.8 | ok |
+| 2 | atomicv2 | 7.51 | 133 | ok |
+| 3 | atomicv3 | **4.35** | **230** | ok |
+| 4 | atomicv4 | 4.70 | 213 | ok |
+
+PMC result:
+
+| Mode | cycles/msg | instructions/msg | CPI | branch miss | Context switches |
+|---|---:|---:|---:|---:|---:|
+| mutex | 604 | 312 | 1.94 | 8.1% | 1,194 |
+| atomicv1 | 234 | 22.6 | 10.4 | 9.3% | 13 |
+| atomicv2 | 56.4 | 20.6 | 2.73 | 6.5% | 5 |
+| **atomicv3** | **30.3** | **19.0** | 1.59 | 0.5% | 3 |
+| atomicv4 | 33.7 | 23.6 | 1.43 | 0.6% | 3 |
+
+### Interpretation
+
+The main optimization steps are clear:
+
+- Removing the mutex improves latency by 2.7x.
+- Cache-line padding plus acquire/release ordering improves latency by another 4.8x.
+- Caching the opponent index improves latency from 7.51 ns/msg to 4.35 ns/msg.
+
+The key mechanism is reduced cross-core traffic. `SpscRingBufferAtomicV3` only acquire-loads the remote index when the ring appears full or empty. On x86-64, the acquire/release atomics lower to ordinary `mov` instructions in the optimized build; there are no `lock`-prefixed operations on the steady path.
+
+`SpscRingBufferAtomicV4` tested monotonic local counters. It has slightly better CPI than V3, but it executes more instructions per message and is about 8% slower. This matches the broader project lesson from the order book: lower CPI or fewer cache misses do not matter if total cycles/op increase.
+
+### Decision
+
+Adopt `SpscRingBufferAtomicV3` as the current queue design for the upcoming system-integration work.
+
+Keep the other versions as references:
+
+- mutex: baseline and negative control;
+- atomicv1: shows the cost of `seq_cst` and false sharing;
+- atomicv2: shows the remaining cost without opponent-index caching;
+- atomicv4: shows that monotonic counters are not automatically faster.
+
+### Next Step
+
+The next project stage is the high-performance order-entry protocol:
+
+- fixed-size binary messages;
+- message header with magic/version, type, payload length, sequence number, and client/session id;
+- NewOrder, CancelOrder, ModifyOrder, Heartbeat, Logout;
+- Accepted, Rejected, Cancelled, Modified, Trade;
+- nonblocking TCP server with `epoll`;
+- per-session input/output buffers and partial read/write handling;
+- sequence checking and basic backpressure;
+- gateway-owned `client_order_id -> OrderHandle` mapping;
+- protocol-level reject reasons and malformed-message tests.
+
+The SPSC queue is the handoff primitive for this design, but it is not yet wired into a gateway or matching-thread runtime.
