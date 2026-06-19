@@ -104,8 +104,8 @@ inline DecodeStatus decode_header(std::span<const std::byte> in, MessageHeader& 
 
     out.magic           = load_u32_le(in, out.off_magic);
     out.version         = load_u16_le(in, out.off_version);
-    out.message_type    = static_cast<MessageType>(load_u16_le(in, out.off_payload_length));
-    out.payload_length  = load_u16_le(in, out.off_version);
+    out.message_type    = static_cast<MessageType>(load_u16_le(in, out.off_message_type));
+    out.payload_length  = load_u16_le(in, out.off_payload_length);
     out.flags           = load_u16_le(in, out.off_flags);
     out.sequence_numer  = load_u64_le(in, out.off_sequence_numer);
     out.session_id      = load_u64_le(in, out.off_session_id);
@@ -197,7 +197,7 @@ inline DecodeStatus decode_new_order(std::span<const std::byte> in, NewOrder& ou
     out.client_order_id = load_u64_le(in, base + out.off_id);
     out.side            = static_cast<Side>(load_u64_le(in, base + out.off_side));
     out.price           = load_u64_le(in, base + out.off_price);
-    out.quantity        = load_u64_le(in, base + out.quantity);
+    out.quantity        = load_u64_le(in, base + out.off_quantity);
 
     return DecodeStatus::Ok;
 }
