@@ -121,36 +121,42 @@ inline DecodeStatus decode_header(std::span<const std::byte> in, MessageHeader& 
 }
 
 
-inline bool is_known_message_type(MessageType type) {
+inline bool is_known_request_type(MessageType type) {
     switch (type) {
         case MessageType::NewOrder:
         case MessageType::CancelOrder:
         case MessageType::ModifyOrder:
         case MessageType::Heartbeat:
         case MessageType::Logout:
+            return true;
+        default:
+            return false;
+    }
+}
+
+
+inline bool is_known_response_type(MessageType type) {
+    switch (type) {
         case MessageType::Accepted:
         case MessageType::Rejected:
         case MessageType::Cancelled:
         case MessageType::Modified:
         case MessageType::Trade:
             return true;
-        }
-        return false;
+        default:
+            return false;
+    }
 }
 
 
 inline std::uint16_t expected_payload_size(MessageType type) {
     switch (type) {
         case MessageType::NewOrder:
-            return kNewOrderPayloadSize;
         case MessageType::CancelOrder:
-            return kCancelOrderPayloadSize;
         case MessageType::ModifyOrder:
-            return kModifyOrderPayloadSize;
         case MessageType::Heartbeat:
-            return kHeartbeatPayloadSize;
         case MessageType::Logout:
-            return kLogoutPayloadSize;
+            return kPayloadSize;
         default:
             return 0;
         }
@@ -158,7 +164,7 @@ inline std::uint16_t expected_payload_size(MessageType type) {
 
 
 inline DecodeStatus validate_header(const MessageHeader& h) {
-    if (!is_known_message_type(h.message_type))
+    if (!is_known_request_type(h.message_type))
         return DecodeStatus::UnknownMessageType;
 
     const auto exepcted = expected_payload_size(h.message_type);
@@ -169,12 +175,15 @@ inline DecodeStatus validate_header(const MessageHeader& h) {
 }
 
 
+
+
+
 inline std::size_t encode_new_order(const MessageHeader& header, const NewOrder& order, std::span<std::byte> out) {
-    const std::size_t total_size = kHeaderSize + kNewOrderPayloadSize;
+    const std::size_t total_size = kHeaderSize + kPayloadSize;
 
     MessageHeader h = header;
     h.message_type = MessageType::NewOrder;
-    h.payload_length = kNewOrderPayloadSize;
+    h.payload_length = kPayloadSize;
 
     encode_header(h, out);
 
@@ -189,7 +198,7 @@ inline std::size_t encode_new_order(const MessageHeader& header, const NewOrder&
 
 
 inline DecodeStatus decode_new_order(std::span<const std::byte> in, NewOrder& out) {
-    if (in.size() < kHeaderSize + kNewOrderPayloadSize)
+    if (in.size() < kHeaderSize + kPayloadSize)
         return DecodeStatus::NeedMoreData;
 
     const std::size_t base = kHeaderSize;
@@ -198,6 +207,67 @@ inline DecodeStatus decode_new_order(std::span<const std::byte> in, NewOrder& ou
     out.side            = static_cast<Side>(load_u64_le(in, base + out.off_side));
     out.price           = load_u64_le(in, base + out.off_price);
     out.quantity        = load_u64_le(in, base + out.off_quantity);
+
+    return DecodeStatus::Ok;
+}
+
+
+
+inline std::size_t encode_cancel_order(const MessageHeader& header, const CancelOrder& order, std::span<std::byte> out) {
+    const std::size_t total_size = kHeaderSize + kPayloadSize;
+
+    MessageHeader h = header;
+    h.message_type = MessageType::CancelOrder;
+    h.payload_length = kPayloadSize;
+
+    encode_header(h, out);
+
+    const std::size_t base = kHeaderSize;
+    store_u64_le(out, base + order.off_id, order.client_order_id);
+
+    return total_size;
+}
+
+
+inline DecodeStatus decode_cancel_order(std::span<const std::byte> in, CancelOrder& out) {
+    if (in.size() < kHeaderSize + kPayloadSize)
+        return DecodeStatus::NeedMoreData;
+
+    const std::size_t base = kHeaderSize;
+
+    out.client_order_id = load_u64_le(in, base + out.off_id);
+
+    return DecodeStatus::Ok;
+}
+
+
+inline std::size_t encode_modify_order(const MessageHeader& header, const ModifyOrder& order, std::span<std::byte> out) {
+    const std::size_t total_size = kHeaderSize + kPayloadSize;
+
+    MessageHeader h = header;
+    h.message_type = MessageType::ModifyOrder;
+    h.payload_length = kPayloadSize;
+
+    encode_header(h, out);
+
+    const std::size_t base = kHeaderSize;
+    store_u64_le(out, base + order.off_id, order.client_order_id);
+    store_u64_le(out, base + order.off_new_price, order.new_price);
+    store_u64_le(out, base + order.off_new_quantity, order.new_quantity);
+
+    return total_size;
+}
+
+
+inline DecodeStatus decode_modify_order(std::span<const std::byte> in, ModifyOrder& out) {
+    if (in.size() < kHeaderSize + kPayloadSize)
+        return DecodeStatus::NeedMoreData;
+
+    const std::size_t base = kHeaderSize;
+
+    out.client_order_id = load_u64_le(in, base + out.off_id);
+    out.new_price       = load_u64_le(in, base + out.off_new_price);
+    out.new_quantity    = load_u64_le(in, base + out.off_new_quantity);
 
     return DecodeStatus::Ok;
 }
