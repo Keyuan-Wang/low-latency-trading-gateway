@@ -34,6 +34,8 @@ The current answer:
 - **63.99M order-book ops/s** on Hetzner CCX23.
 - **94.81 instructions/op** after LTO.
 - **4.35 ns/message** for the standalone SPSC transport primitive.
+- A fixed **64-byte binary order-entry protocol** with parser, response codec,
+  session validation, and a blocking protocol prototype.
 - Full experiment history, including rejected ideas, is preserved in [`PROJECT_HISTORY.md`](PROJECT_HISTORY.md).
 
 ---
@@ -49,7 +51,7 @@ Most matching-engine examples stop at correctness. This one went further:
 - replaced ordered price lookup with direct-addressed price levels;
 - added bitmap-based next-best-price discovery;
 - validated Linux isolation, perf sampling, per-scenario attribution, and LTO;
-- then moved outward into SPSC transport for gateway/matching-thread integration.
+- then moved outward into SPSC transport and a compact binary order-entry boundary.
 
 The important part is not just the final number. The important part is the discipline:
 
@@ -89,6 +91,25 @@ SPSC report:
 
 ```text
 report/spsc_cloud_benchmark_20260617.md
+```
+
+### Order Entry Boundary
+
+The `order_entry` module is a compact protocol-facing prototype:
+
+| Component | Status |
+|---|---|
+| Wire format | fixed 64B frame: 32B header + 32B payload |
+| Requests | `NewOrder`, `CancelOrder`, `ModifyOrder`, `Heartbeat`, `Logout` |
+| Responses | `Accepted`, `Rejected`, `Cancelled`, `Modified`, `Trade` |
+| Parser | per-session ring buffer, partial reads, multi-frame input |
+| Session logic | sequence check, duplicate/unknown-id reject, invalid price/qty reject |
+| TCP prototype | blocking single-connection request -> response demo |
+
+Order-entry report:
+
+```text
+report/order_entry_protocol_codec_design.md
 ```
 
 ---
@@ -144,7 +165,8 @@ This is the compressed story. The full version lives in [`PROJECT_HISTORY.md`](P
 | Phase 8b | 17.2 ns/op | 58.1M ops/s | unified array side book |
 | Phase 11 | **15.63 ns/op** | **63.99M ops/s** | LTO and core freeze |
 
-Phase 12 starts the next layer: SPSC transport, then binary order-entry protocol and gateway integration.
+Phase 12 added SPSC transport. Phase 13 adds the binary order-entry protocol
+boundary and a small session/gateway prototype.
 
 ---
 
@@ -180,6 +202,7 @@ Setup, random generation, cancel-target selection, and handle resolution happen 
 ```text
 core/matching_core/     matching engine and order book
 core/SPSC/              SPSC ring-buffer implementations and standalone test
+core/order_entry/       fixed-frame binary protocol, parser, session prototype
 benchmark/              HFT macro benchmark, scenario collector, scripts
 report/                 phase reports and benchmark analysis
 server_results/         remote benchmark artifacts
@@ -191,6 +214,7 @@ Important reports:
 - [`PROJECT_HISTORY.md`](PROJECT_HISTORY.md) - full chronological project log
 - [`report/phase11_lto_pgo_results.md`](report/phase11_lto_pgo_results.md) - final matching-core compiler results
 - [`report/spsc_cloud_benchmark_20260617.md`](report/spsc_cloud_benchmark_20260617.md) - SPSC queue benchmark
+- [`report/order_entry_protocol_codec_design.md`](report/order_entry_protocol_codec_design.md) - binary order-entry protocol and frame parser
 - [`report/phase8_array_side_book_results.md`](report/phase8_array_side_book_results.md) - array side book results
 - [`report/phase9_per_scenario_benchmark.md`](report/phase9_per_scenario_benchmark.md) - per-scenario and Linux isolation campaign
 
@@ -226,6 +250,15 @@ Standalone SPSC benchmark:
 cd core/SPSC
 g++ -O3 -std=c++20 -pthread test.cpp -o test
 ./test all 50000000
+```
+
+Order-entry tests and blocking protocol demo:
+
+```bash
+cmake --build build --target order_entry_tests
+./build/core/order_entry/order_entry_tests
+
+cmake --build build --target order_entry_blocking_server order_entry_blocking_client
 ```
 
 ---
@@ -267,21 +300,16 @@ Done:
 - direct-addressed array side book;
 - handle-based cancel/modify API;
 - HFT macro benchmark and perf workflow;
-- SPSC queue study and recommended queue variant.
-
-Next:
-
+- SPSC queue study and recommended queue variant;
 - fixed-size binary order-entry protocol;
-- nonblocking TCP server with `epoll`;
-- per-session input/output buffers;
-- sequence checking and backpressure;
-- gateway-side `client_order_id -> OrderHandle`;
-- SPSC integration between gateway and matching thread.
+- frame parser, response codec, and session validation;
+- blocking single-connection protocol prototype.
 
 Not production-complete yet:
 
-- no network gateway is wired in;
-- SPSC queue is standalone;
+- no kernel-bypass or production-grade network stack;
+- no multi-client `epoll` gateway;
+- SPSC queue is not wired into matching runtime;
 - no persistence/recovery;
 - no risk layer;
 - `OrderHandle` is still a raw pool index, not a generation-protected production token.

@@ -1343,3 +1343,177 @@ The next project stage is the high-performance order-entry protocol:
 - protocol-level reject reasons and malformed-message tests.
 
 The SPSC queue is the handoff primitive for this design, but it is not yet wired into a gateway or matching-thread runtime.
+
+## Phase 13: Order-Entry Protocol Boundary Prototype
+
+### Motivation
+
+After the matching core and SPSC queue were complete, the next useful layer was
+not another order-book data-structure rewrite. The remaining gap was the external
+boundary: how a client request becomes a decoded command before it ever reaches
+the matching engine.
+
+The goal was intentionally modest:
+
+- build a small binary order-entry protocol;
+- keep the wire format fixed and easy to parse;
+- handle TCP byte-stream framing;
+- add basic session/gateway validation;
+- stop before production networking, kernel bypass, or multi-client gateway
+  engineering.
+
+This keeps `llmes` focused. The matching core remains the low-latency hot path;
+`order_entry` demonstrates the protocol-facing boundary around it.
+
+### Protocol Shape
+
+The order-entry protocol uses a fixed 64-byte frame:
+
+```text
+32B header + 32B payload
+```
+
+The header includes:
+
+- magic/version;
+- message type;
+- payload length;
+- flags;
+- sequence number;
+- session id;
+- reserved space.
+
+Request messages:
+
+- `NewOrder`;
+- `CancelOrder`;
+- `ModifyOrder`;
+- `Heartbeat`;
+- `Logout`.
+
+Response messages:
+
+- `Accepted`;
+- `Rejected`;
+- `Cancelled`;
+- `Modified`;
+- `Trade`.
+
+All payloads are 32 bytes. Small control messages such as `Heartbeat` and
+`Logout` use reserved payload bytes. This wastes a few bytes, but it keeps the
+parser fixed-size and removes variable-length framing from the hot path.
+
+### Implementation
+
+The module lives under:
+
+```text
+core/order_entry/
+```
+
+Main components:
+
+| File | Role |
+|---|---|
+| `protocol.hpp` | wire constants, message types, request/response structs |
+| `codec.hpp` | explicit little-endian encode/decode helpers |
+| `frame_parser.hpp` | per-session ring-buffer parser for TCP byte streams |
+| `session.hpp` | sequence/order-id validation and response generation |
+| `examples/blocking_server.cpp` | single-connection request -> response prototype |
+| `examples/blocking_client.cpp` | demo client |
+
+The codec writes fields by explicit wire offsets rather than using
+`memcpy(struct)`, avoiding C++ padding and ABI assumptions.
+
+The parser uses a fixed-size ring buffer. `append()` handles arbitrary TCP byte
+chunks, including write wrap. `try_parse()` only consumes complete 64-byte
+frames. Because frame size and parser capacity are aligned, parse-time frames
+remain physically contiguous in the ring.
+
+### Session Validation
+
+`OrderEntrySession` adds a small gateway-like validation layer:
+
+- expected sequence number check;
+- duplicate `client_order_id` reject;
+- unknown cancel/modify reject;
+- invalid price/quantity reject;
+- local fake `order_handle` assignment;
+- `Logout` returns a close-session signal.
+
+This is not yet matching-engine integration. The session-owned handle is a
+placeholder for the real matching-core `OrderHandle` that a production gateway
+would receive after insertion.
+
+### Tests
+
+`order_entry_tests` covers:
+
+- request codec round trips;
+- response codec round trips;
+- bad magic/version/type/payload length;
+- parser empty/partial/multi-frame behavior;
+- parser bad-frame non-consumption;
+- parser buffer-full behavior;
+- ring-buffer append wrap;
+- session accepted/rejected/cancelled/modified/logout paths.
+
+Validation command:
+
+```text
+cmake --build build --target order_entry_tests
+./build/core/order_entry/order_entry_tests
+```
+
+Result:
+
+```text
+order_entry tests passed
+```
+
+### Blocking TCP Baseline
+
+A deliberately naive blocking echo benchmark was added:
+
+```text
+benchmark/scripts/local/order_entry_blocking_echo.sh
+```
+
+Local WSL result:
+
+| Messages | Total ns | Avg RTT ns/msg | One-way estimate ns/msg |
+|---:|---:|---:|---:|
+| 100,000 | 4,907,399,662 | 49,074 | 24,537 |
+
+Artifact:
+
+```text
+benchmark/results/order_entry_blocking_echo_20260621_164453/
+```
+
+This number is not a matching-engine latency result. It measures a blocking
+loopback TCP ping-pong through the kernel stack and process scheduling. It is
+useful only as a scale reference for the protocol boundary. The 15.63 ns/op
+matching-core result remains an in-process hot-path result.
+
+### Decision
+
+The order-entry module is complete as a protocol boundary prototype.
+
+The project deliberately does not continue into:
+
+- production nonblocking `epoll`;
+- multi-client gateway/session management;
+- multi-symbol sharding;
+- kernel bypass;
+- direct matching-engine wiring.
+
+Those directions add breadth, but not much more depth for the current project.
+Without bare-metal NIC access, network optimization would mostly measure the
+kernel, VM, and scheduler rather than the code under study.
+
+At this point `llmes` has three completed layers:
+
+- nanosecond-scale in-process matching core;
+- low-latency SPSC transport primitive;
+- compact binary order-entry protocol boundary.

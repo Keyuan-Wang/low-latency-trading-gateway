@@ -13,21 +13,22 @@ that a real matching engine would expose to clients:
 TCP byte stream -> fixed-size protocol frames -> decoded request messages
 ```
 
-The codec still stays independent from sockets. The frame parser owns the
-per-session byte buffer and handles partial reads. The future socket layer will
-read from nonblocking TCP and append bytes into this parser.
+The codec stays independent from sockets. The frame parser owns the per-session
+byte buffer and handles partial reads. The session layer validates decoded
+messages and produces binary response frames.
 
 ## Design Summary
 
 The current design uses:
 
 - a 32-byte message header;
-- a fixed 32-byte payload for every request type;
+- a fixed 32-byte payload for every request and response type;
 - a fixed 64-byte wire frame;
 - explicit little-endian integer encoding;
 - manual field offsets instead of `memcpy(struct)`;
 - `std::span<std::byte>` as the buffer interface;
-- no dynamic allocation on the encode/decode or frame-parse path.
+- no dynamic allocation on the encode/decode or frame-parse path;
+- a small session validation layer for order-entry semantics.
 
 Every request frame has the same shape:
 
@@ -37,9 +38,10 @@ Payload 32 bytes
 Total   64 bytes
 ```
 
-`NewOrder`, `CancelOrder`, `ModifyOrder`, `Heartbeat`, and `Logout` all use the
-same 64-byte wire frame. Some messages do not need 32 bytes of business payload,
-so unused bytes are reserved and should be zero-filled by the encoder.
+`NewOrder`, `CancelOrder`, `ModifyOrder`, `Heartbeat`, `Logout`, and all
+response messages use the same 64-byte wire frame. Some messages do not need 32
+bytes of business payload, so unused bytes are reserved and should be zero-filled
+by the encoder.
 
 This wastes a few bytes for small control messages, but removes variable-length
 framing from the hot parser path.
@@ -62,10 +64,10 @@ The protocol header is logically represented by `MessageHeader`, but the C++ str
 This is why the codec writes fields one by one:
 
 ```cpp
-store_u64_le(out, MessageHeader::off_sequence_numer, h.sequence_numer);
+store_u64_le(out, MessageHeader::off_sequence_number, h.sequence_number);
 ```
 
-The offset is the wire-buffer offset, not `offsetof(MessageHeader, sequence_numer)`. This avoids C++ padding and ABI issues.
+The offset is the wire-buffer offset, not `offsetof(MessageHeader, sequence_number)`. This avoids C++ padding and ABI issues.
 
 ## Request Payload Layout
 
@@ -142,18 +144,18 @@ The current codec layer is responsible for:
 - decoding headers;
 - checking magic/version;
 - checking whether the request message type is known;
+- checking whether the response message type is known;
 - checking whether `payload_length` is the fixed 32-byte payload size;
-- encoding and decoding request payloads.
+- encoding and decoding request payloads;
+- encoding and decoding response payloads.
 
 It deliberately does not handle:
 
 - TCP reads or writes;
-- session sequence validation;
-- `client_order_id -> OrderHandle` lookup;
-- duplicate order rejection;
 - matching-engine calls.
 
-Those are later gateway/session responsibilities.
+Session sequence validation and protocol-level order-id checks live in
+`OrderEntrySession`.
 
 ## Frame Parser Design
 
@@ -245,6 +247,40 @@ bytes across threads would make partial-frame state concurrent and would add
 cache-line traffic for very little gain. Passing complete decoded commands is a
 cleaner boundary.
 
+## Session And Gateway Validation
+
+`OrderEntrySession` turns decoded request messages into response frames. It is
+still intentionally small and does not call the matching engine yet.
+
+The session layer currently handles:
+
+- expected sequence number validation;
+- `client_order_id -> order_handle` tracking;
+- duplicate new-order rejection;
+- unknown cancel/modify rejection;
+- invalid price/quantity rejection;
+- `NewOrder -> Accepted`;
+- `CancelOrder -> Cancelled`;
+- `ModifyOrder -> Modified`;
+- `Heartbeat -> Accepted`;
+- `Logout -> Accepted` and close-session signal.
+
+This makes the blocking prototype a real protocol boundary instead of a plain
+echo server:
+
+```text
+recv bytes
+-> FrameParser
+-> DecodedMessage
+-> OrderEntrySession
+-> response codec
+-> send response frame
+```
+
+The `order_handle` is currently a local fake handle allocated by the session.
+When this module is wired into the matching engine, that field should carry the
+real matching-core handle.
+
 ## Why This Shape Fits The Project
 
 The matching core is already optimized around predictable memory access and low instruction count. The protocol follows the same philosophy:
@@ -266,20 +302,73 @@ socket read
 -> SPSC command queue / matching thread
 ```
 
-## Current Limitations And Next Steps
+## Naive Blocking TCP Baseline
 
-This is still before the real TCP server.
+A minimal blocking TCP echo benchmark was added as the first network baseline.
+It is intentionally simple:
 
-The next missing pieces are:
+```text
+client:
+  send one 64-byte NewOrder frame
+  wait for one 64-byte echo
 
-- stronger round-trip tests for every request type;
-- tests for bad magic, bad version, unknown message type, and bad payload length;
-- side validation (`Buy` or `Sell` only);
-- tests for partial reads, multiple frames in one buffer, and ring-buffer write wrap;
-- response encoding support (`Accepted`, `Rejected`, `Cancelled`, `Modified`, `Trade`);
-- sequence-number validation at the session layer;
-- duplicate order rejection and unknown cancel rejection at the gateway layer.
+server:
+  recv one 64-byte frame
+  parse it with FrameParser
+  echo the same 64 bytes back
+```
 
-After these tests are in place, the project can move to a blocking protocol
-server first, then to nonblocking `epoll`, per-session input/output buffers, and
-backpressure.
+This benchmark measures a full local round trip through:
+
+```text
+client send
+-> loopback TCP
+-> server recv
+-> FrameParser
+-> server send
+-> client recv
+```
+
+It is not a final latency number. The implementation is blocking, single-client,
+happy-path only, and does not use `epoll`, CPU pinning, tuned scheduling, or
+production-style output buffers. Its purpose is to show the cost scale of a
+plain TCP boundary, not to represent the matching engine hot path.
+
+Local WSL result on June 21, 2026:
+
+| Benchmark | Messages | Total ns | Avg RTT ns/msg | One-way estimate ns/msg |
+|---|---:|---:|---:|---:|
+| blocking echo | 100,000 | 4,907,399,662 | 49,074 | 24,537 |
+
+Result directory:
+
+```text
+benchmark/results/order_entry_blocking_echo_20260621_164453/
+```
+
+## Current Status
+
+As a protocol boundary prototype, `order_entry` is complete enough to close this
+project phase:
+
+- fixed 64-byte request/response protocol;
+- explicit little-endian codec;
+- request and response round-trip tests;
+- ring-buffer frame parser tests for partial reads, multi-frame input, bad
+  frames, buffer full, and append wrap;
+- session validation tests for accepted, rejected, cancelled, modified, bad
+  sequence, and logout paths;
+- blocking single-connection server/client demo;
+- local blocking TCP echo baseline.
+
+The module deliberately stops short of:
+
+- production nonblocking `epoll`;
+- multi-client session management;
+- kernel bypass / userspace networking;
+- multi-symbol sharding;
+- direct matching-engine integration.
+
+Those are useful systems topics, but they would expand the project sideways.
+For `llmes`, the stronger story is that the matching core is the low-latency
+hot path, while `order_entry` demonstrates the external binary protocol boundary.
