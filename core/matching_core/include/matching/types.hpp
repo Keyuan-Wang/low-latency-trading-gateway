@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace matching {
+namespace llmes::matching_core {
 
 class PriceLevel;  // forward decl — full definition in price_level.hpp
 

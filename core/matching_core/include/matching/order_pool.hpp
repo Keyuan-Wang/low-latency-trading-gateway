@@ -6,7 +6,7 @@
 
 #include "types.hpp"
 
-namespace matching {
+namespace llmes::matching_core {
 
 class OrderPool {
 private:

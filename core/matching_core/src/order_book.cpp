@@ -1,6 +1,6 @@
 /**
  * @file order_book.cpp
- * @brief Implementation of @ref matching::OrderBook (Phase 1: map + list, FIFO per level).
+ * @brief Implementation of @ref llmes::matching_core::OrderBook (Phase 1: map + list, FIFO per level).
  */
 
 #include <algorithm>
@@ -11,7 +11,7 @@
 #include "matching/order_pool.hpp"
 #include "matching/types.hpp"
 
-namespace matching {
+namespace llmes::matching_core {
 
 namespace {
 
@@ -216,4 +216,4 @@ std::uint64_t OrderBook::matching_engine_market(AddResult& out, std::uint64_t or
     return quantity;
 }
 
-}  // namespace matching
+}  // namespace llmes::matching_core
