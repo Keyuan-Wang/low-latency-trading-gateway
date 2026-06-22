@@ -166,6 +166,7 @@ public:
     static_assert(Capacity >= 2);
     static_assert(is_power_of_two(Capacity));
 
+    
     bool push(const T& value) {
         const std::size_t head = head_.value.load(std::memory_order_relaxed);
         const std::size_t next = increment(head);
@@ -183,6 +184,27 @@ public:
         head_.value.store(next, std::memory_order_release);
         return true;
     }
+
+
+    template <typename ... Args>
+    bool emplace(Args&& ... args) {
+        const std::size_t head = head_.value.load(std::memory_order_relaxed);
+        const std::size_t next = increment(head);
+
+        if (next == producer_tail_cache_.value) {
+            producer_tail_cache_.value =
+                tail_.value.load(std::memory_order_acquire);
+
+            if (next == producer_tail_cache_.value) {
+                return false;
+            }
+        }
+
+        buffer_[head] = T(std::forward<Args>(args)...);
+        head_.value.store(next, std::memory_order_release);
+        return true;
+    }
+
 
     bool pop(T& out) {
         const std::size_t tail = tail_.value.load(std::memory_order_relaxed);
