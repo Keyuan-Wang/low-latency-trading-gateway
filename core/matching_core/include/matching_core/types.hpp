@@ -28,7 +28,7 @@ struct PriceCompare<false> {
 };
 
 
-enum class Side {
+enum class Side : std::uint32_t {
     Buy,   ///< Bid side (buy book).
     Sell,  ///< Ask side (sell book).
 };
@@ -42,7 +42,7 @@ struct Trade {
 };
 
 
-enum class ErrorCode {
+enum class ErrorCode : std::uint32_t {
     Success,                   ///< Operation completed as requested.
     InvalidQuantity,           ///< Non-positive quantity (e.g. zero).
     DuplicateOrderId,          ///< Order id already present on the book.
@@ -61,8 +61,6 @@ struct AddResult {
     std::uint64_t remaining_quantity{0};   ///< Unfilled quantity after matching / rest.
 
     OrderHandle handle{kInvalidHandle};
-
-    std::vector<Trade> trades{};           ///< Individual fills, in chronological order.
 };
 
 

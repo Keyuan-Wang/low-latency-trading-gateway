@@ -1,10 +1,11 @@
+#pragma once
+
 /**
  * @file order_book.hpp
  * @brief Central limit order book (Phase 1): declarations for @ref llmes::matching_core::OrderBook and related types.
  */
 
-#pragma once
-
+#include <concepts>
 #include <cstdint>
 #include <map>
 #include <utility>
@@ -15,6 +16,7 @@
 #include "price_level.hpp"
 #include "order_pool.hpp"
 #include "array_side_book.hpp"
+#include "trade_sink.hpp"
 
 namespace llmes::matching_core {
 /**
@@ -64,10 +66,17 @@ using BidBook = SideBook<false>;
  *
  * @note The matching core assumes the gateway has validated business order ids.
  */
+template <TradeSink Sink = NullTradeSink>
 class OrderBook {
 public:
-    /** @brief Constructs an empty book. */
-    explicit OrderBook(std::size_t pool_capacity = 100000) : pool_(pool_capacity) {};
+    /** @brief Constructs an empty book with a default-initialized trade sink. */
+    explicit OrderBook(std::size_t pool_capacity = 100000)
+        requires std::default_initializable<Sink>
+        : sink_{}, pool_(pool_capacity) {}
+
+    /** @brief Constructs an empty book with the given trade sink. */
+    explicit OrderBook(Sink sink, std::size_t pool_capacity = 100000)
+        : sink_(std::move(sink)), pool_(pool_capacity) {}
 
     /**
      * @brief Submit a limit order: match against the opposite side, rest remainder on book.
@@ -77,7 +86,7 @@ public:
      * @param price      Limit price; used for crossing check and for resting level.
      * @param quantity   Desired quantity (> 0).
      * @param timestamp  Opaque event time (stored on resting portion).
-     * @return @ref AddResult with @ref AddResult::trades and fill/rest fields set.
+     * @return @ref AddResult with fill/rest fields set; trades are emitted via the book's sink.
      *
      * @retval ErrorCode::Success Resting portion (if any) posted; or fully filled.
      * @retval ErrorCode::InvalidQuantity @p quantity == 0.
@@ -125,6 +134,7 @@ private:
     ArraySideBook<false> bids_;   ///< Bid price levels (best bid at @c begin()).
     ArraySideBook<true> asks_;   ///< Ask price levels (best ask at @c begin()).
 
+    Sink sink_;
     OrderPool pool_;
 
     template <Side S>
@@ -134,10 +144,19 @@ private:
     };
 
     template <Side S>
-    std::uint64_t matching_engine_limit(AddResult& out, std::uint64_t order_id, std::int64_t price, std::uint64_t quantity);
+    std::uint64_t matching_engine_limit(AddResult& out,
+                                        std::uint64_t order_id,
+                                        std::int64_t price,
+                                        std::uint64_t quantity);
 
     template <Side S>
     std::uint64_t matching_engine_market(AddResult& out, std::uint64_t order_id, std::uint64_t quantity);
 };
 
 }  // namespace llmes::matching_core
+
+
+
+#define LLMES_ORDER_BOOK_IMPL_INCLUDED
+#include "order_book_impl.hpp"
+#undef LLMES_ORDER_BOOK_IMPL_INCLUDED

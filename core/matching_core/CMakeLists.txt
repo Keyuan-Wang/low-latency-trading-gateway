@@ -1,5 +1,4 @@
 add_library(matching_core
-  src/order_book.cpp
   src/occupancy_tree.cpp
 )
 
