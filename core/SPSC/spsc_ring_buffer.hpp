@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <mutex>
+#include <utility>
 
 namespace llmes::spsc {
 

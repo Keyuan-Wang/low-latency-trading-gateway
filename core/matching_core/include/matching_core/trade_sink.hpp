@@ -2,6 +2,7 @@
 
 #include "types.hpp"
 #include <concepts>
+#include <vector>
 
 namespace llmes::matching_core {
 
