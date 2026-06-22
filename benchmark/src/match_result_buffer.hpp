@@ -29,21 +29,41 @@ public:
 		trades_.reserve(trade_capacity);
 	}
 
+	void reset(std::size_t result_capacity, std::size_t trade_capacity) {
+		records_.clear();
+		records_.resize(result_capacity);
+		trades_.clear();
+		trades_.reserve(trade_capacity);
+		record_count_ = 0;
+		next_op_index_ = 0;
+	}
+
 	void clear() noexcept {
 		records_.clear();
 		trades_.clear();
+		record_count_ = 0;
 		next_op_index_ = 0;
 	}
 
 	[[gnu::always_inline]] inline std::size_t
 	append_result(const llmes::matching_core::AddResult& result) {
-		records_.push_back(MatchResultRecord{
+		const std::size_t record_index = record_count_++;
+		if (record_index == records_.size()) {
+			records_.push_back({});
+		}
+		records_[record_index] = MatchResultRecord{
 				next_op_index_++,
 				result,
 				trades_.size(),
 				0,
-		});
-		return records_.size() - 1;
+		};
+		return record_index;
+	}
+
+	[[gnu::always_inline]] inline void
+	set_result(std::size_t record_index,
+						 const llmes::matching_core::AddResult& result) noexcept {
+		records_[record_index].result = result;
 	}
 
 	[[gnu::always_inline]] inline void
@@ -54,8 +74,19 @@ public:
 		trades_.insert(trades_.end(), trades.begin(), trades.end());
 	}
 
+	[[gnu::always_inline]] inline void
+	append_trade(std::size_t record_index,
+							 const llmes::matching_core::Trade& trade) {
+		auto& record = records_[record_index];
+		if (record.trade_count == 0) {
+			record.trade_begin = trades_.size();
+		}
+		trades_.push_back(trade);
+		++record.trade_count;
+	}
+
 	[[nodiscard]] std::span<const MatchResultRecord> records() const noexcept {
-		return records_;
+		return std::span<const MatchResultRecord>(records_.data(), record_count_);
 	}
 
 	[[nodiscard]] std::span<const llmes::matching_core::Trade> trades() const noexcept {
@@ -72,6 +103,7 @@ public:
 private:
 	std::vector<MatchResultRecord> records_;
 	std::vector<llmes::matching_core::Trade> trades_;
+	std::size_t record_count_ = 0;
 	std::uint64_t next_op_index_ = 0;
 };
 

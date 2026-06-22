@@ -291,7 +291,8 @@ inline double Percentile(std::vector<double> values, double p) {
 	* @param levels   Number of distinct price levels.
 	* @param id_base  Starting order-ID offset.
 	*/
-inline void PrefillSellBook(llmes::matching_core::OrderBook& book, std::uint64_t orders,
+template <llmes::matching_core::TradeSink Sink>
+inline void PrefillSellBook(llmes::matching_core::OrderBook<Sink>& book, std::uint64_t orders,
 														std::uint64_t levels, std::uint64_t id_base,
 														std::vector<llmes::matching_core::OrderHandle>* handles = nullptr) {
 	const std::uint64_t per_level =
@@ -329,7 +330,8 @@ inline void PrefillSellBook(llmes::matching_core::OrderBook& book, std::uint64_t
 	* @param seed      Deterministic RNG seed for ID generation.
 	* @param side      Side to place orders (Sell for asks, Buy for bids).
 	*/
-inline void PrefillHftBook(llmes::matching_core::OrderBook& book,
+template <llmes::matching_core::TradeSink Sink>
+inline void PrefillHftBook(llmes::matching_core::OrderBook<Sink>& book,
 														std::uint64_t orders,
 														std::uint64_t levels,
 														std::int64_t base_price = 1000,
