@@ -73,7 +73,6 @@ public:
 
         rest_order(order_id, side, price, remaining);
         out.code = llmes::matching_core::ErrorCode::Success;
-        out.handle = 0;  // Fake valid handle. Tests compare validity only.
         return out;
     }
 
@@ -220,7 +219,6 @@ private:
 };
 
 struct LiveOrder {
-    llmes::matching_core::OrderHandle handle = llmes::matching_core::kInvalidHandle;
     llmes::matching_core::Side side = llmes::matching_core::Side::Buy;
     std::int64_t price = 0;
     std::uint64_t quantity = 0;
@@ -248,10 +246,6 @@ void ExpectSameAddResult(const llmes::matching_core::AddResult& actual,
     for (std::size_t i = 0; i < actual_trades.size(); ++i) {
         ExpectSameTrade(actual_trades[i], expected_trades[i], i);
     }
-
-    const bool actual_has_handle = actual.handle != llmes::matching_core::kInvalidHandle;
-    const bool expected_has_handle = expected.handle != llmes::matching_core::kInvalidHandle;
-    EXPECT_EQ(actual_has_handle, expected_has_handle);
 }
 
 class ResultHarness {
@@ -294,14 +288,13 @@ public:
         auto live_it = live_.find(order_id);
         ASSERT_NE(live_it, live_.end());
 
-        const llmes::matching_core::OrderHandle handle = live_it->second.handle;
         live_.erase(live_it);
 
         const auto expected =
             expected_.modify_order(order_id, side, price, quantity, timestamp);
         actual_trades_.clear();
         const auto actual =
-            actual_.modify_order(handle, side, price, quantity, timestamp);
+            actual_.modify_order(order_id, side, price, quantity, timestamp);
         ExpectSameAddResult(actual, actual_trades_, expected, expected_.trades());
         apply_result(order_id, side, price, actual, actual_trades_);
     }
@@ -310,8 +303,7 @@ public:
         auto live_it = live_.find(order_id);
         ASSERT_NE(live_it, live_.end());
 
-        const llmes::matching_core::OrderHandle handle = live_it->second.handle;
-        (void)actual_.cancel_order(handle);
+        (void)actual_.cancel_order(order_id);
         (void)expected_.cancel_order(order_id);
         live_.erase(live_it);
     }
@@ -339,9 +331,8 @@ private:
         apply_trades(trades);
         if (result.code == llmes::matching_core::ErrorCode::Success &&
             result.remaining_quantity > 0) {
-            ASSERT_NE(result.handle, llmes::matching_core::kInvalidHandle);
             live_[order_id] =
-                LiveOrder{result.handle, side, price, result.remaining_quantity};
+                LiveOrder{side, price, result.remaining_quantity};
         }
     }
 

@@ -38,9 +38,14 @@ inline bool can_cross_limit(std::int64_t limit_price, std::int64_t best_opposite
  * @copydoc OrderBook::cancel_order
  */
 template <TradeSink Sink>
-ErrorCode OrderBook<Sink>::cancel_order(OrderHandle h) {
-    Order* o = pool_.resolve(h);
+ErrorCode OrderBook<Sink>::cancel_order(std::uint64_t order_id) {
+    auto it = order_index_.find(order_id);
+    if (it == order_index_.end()) {
+        return ErrorCode::UnknownOrderId;
+    }
 
+    Order* o = it->second;
+    order_index_.erase(it);
     o->parent_level->erase(*o);
     pool_.release(o);
 
@@ -51,12 +56,18 @@ ErrorCode OrderBook<Sink>::cancel_order(OrderHandle h) {
  * @copydoc OrderBook::modify_order
  */
 template <TradeSink Sink>
-AddResult OrderBook<Sink>::modify_order(OrderHandle h, Side side, std::int64_t price,
+AddResult OrderBook<Sink>::modify_order(std::uint64_t order_id, Side side, std::int64_t price,
                                         std::uint64_t quantity, std::uint64_t timestamp) {
-    Order* o = pool_.resolve(h);
+    auto it = order_index_.find(order_id);
+    if (it == order_index_.end()) {
+        AddResult out{};
+        out.initial_quantity = quantity;
+        out.code = ErrorCode::UnknownOrderId;
+        return out;
+    }
 
-    const auto order_id = o->id;
-
+    Order* o = it->second;
+    order_index_.erase(it);
     o->parent_level->erase(*o);
     pool_.release(o);
 
@@ -77,6 +88,10 @@ AddResult OrderBook<Sink>::add_limit_order(std::uint64_t order_id, Side side, st
         return out;
     }
 
+    if (order_index_.find(order_id) != order_index_.end()) {
+        out.code = ErrorCode::DuplicateOrderId;
+        return out;
+    }
 
     if (side == Side::Buy) {
         out.remaining_quantity = matching_engine_limit<Side::Buy>(out, order_id, price, quantity);
@@ -90,11 +105,7 @@ AddResult OrderBook<Sink>::add_limit_order(std::uint64_t order_id, Side side, st
     }
 
     // add remaining limit order to book
-    OrderHandle h = pool_.acquire();
-
-    assert(h != kInvalidHandle);
-
-    Order* node = pool_.resolve(h);
+    Order* node = pool_.acquire();
     // TODO: WHAT IF POOL IS ALREADY EMPTY?
     assert(node != nullptr);
 
@@ -118,7 +129,7 @@ AddResult OrderBook<Sink>::add_limit_order(std::uint64_t order_id, Side side, st
 
     // output
     out.code = ErrorCode::Success;
-    out.handle = h;
+    order_index_[order_id] = node;
     return out;
 }
 
@@ -137,6 +148,10 @@ AddResult OrderBook<Sink>::add_market_order(std::uint64_t order_id, Side side, s
         return out;
     }
 
+    if (order_index_.find(order_id) != order_index_.end()) {
+        out.code = ErrorCode::DuplicateOrderId;
+        return out;
+    }
 
     if (side == Side::Buy) {
         out.remaining_quantity = matching_engine_market<Side::Buy>(out, order_id, quantity);
@@ -182,6 +197,7 @@ std::uint64_t OrderBook<Sink>::matching_engine_limit(AddResult& out,
 
             if (maker.quantity == 0) {
                 Order* maker_ptr = &maker;
+                order_index_.erase(maker.id);
                 price_level.erase(*maker_ptr);
                 pool_.release(maker_ptr);
             }
@@ -214,6 +230,7 @@ std::uint64_t OrderBook<Sink>::matching_engine_market(AddResult& out, std::uint6
 
             if (maker.quantity == 0) {
                 Order* maker_ptr = &maker;
+                order_index_.erase(maker.id);
                 price_level.erase(*maker_ptr);
                 pool_.release(maker_ptr);
             }

@@ -10,6 +10,7 @@
 #include <map>
 #include <utility>
 #include <cstddef>  // std::byte, std::size_t
+#include <unordered_map>
 
 
 #include "types.hpp"
@@ -62,9 +63,7 @@ using BidBook = SideBook<false>;
  * @details
  * - Bids and asks are stored in separate @ref BidBook / @ref AskBook maps.
  * - Each price maps to a @ref PriceLevel (`std::list`) for FIFO per level.
- * - Resting orders are addressed by an engine handle returned from add.
- *
- * @note The matching core assumes the gateway has validated business order ids.
+ * - Resting orders are found by business order id through an internal hash map.
  */
 template <TradeSink Sink = NullTradeSink>
 class OrderBook {
@@ -81,7 +80,7 @@ public:
     /**
      * @brief Submit a limit order: match against the opposite side, rest remainder on book.
      *
-     * @param order_id   Business/reporting order id; not used for hot-path lookup.
+     * @param order_id   Business/reporting order id.
      * @param side       @ref Side::Buy consumes asks; @ref Side::Sell consumes bids.
      * @param price      Limit price; used for crossing check and for resting level.
      * @param quantity   Desired quantity (> 0).
@@ -90,6 +89,7 @@ public:
      *
      * @retval ErrorCode::Success Resting portion (if any) posted; or fully filled.
      * @retval ErrorCode::InvalidQuantity @p quantity == 0.
+     * @retval ErrorCode::DuplicateOrderId @p order_id is already live.
      */
     AddResult add_limit_order(std::uint64_t order_id, Side side, std::int64_t price,
                               std::uint64_t quantity, std::uint64_t timestamp);
@@ -105,30 +105,31 @@ public:
      *
      * @retval ErrorCode::Success Fully filled.
      * @retval ErrorCode::MarketRemainderCancelled Partially filled; remainder discarded.
+     * @retval ErrorCode::DuplicateOrderId @p order_id is already live.
      */
     AddResult add_market_order(std::uint64_t order_id, Side side, std::uint64_t quantity,
                                std::uint64_t timestamp);
 
     /**
-     * @brief Atomically replace a resting order addressed by handle.
+     * @brief Atomically replace a resting order addressed by order id.
      *
-     * @param h         Engine handle returned by a previous resting add.
+     * @param order_id  Business order id of the live resting order.
      * @param side      Side for the replacement order.
      * @param price     Limit price for the replacement order.
      * @param quantity  Quantity for the replacement order (> 0).
      * @param timestamp Opaque event time for the replacement order.
-     * @return @ref AddResult from the replacement add, or @ref ErrorCode::InvalidQuantity.
+     * @return @ref AddResult from the replacement add, or an error result.
      */
-    AddResult modify_order(OrderHandle h, Side side, std::int64_t price,
+    AddResult modify_order(std::uint64_t order_id, Side side, std::int64_t price,
                            std::uint64_t quantity, std::uint64_t timestamp);
 
     /**
-     * @brief Remove a resting order by engine handle.
+     * @brief Remove a resting order by order id.
      *
-     * @param h Engine handle returned by a previous resting add.
+     * @param order_id Business order id of the live resting order.
      * @return @ref ErrorCode::Success if removed from book.
      */
-    ErrorCode cancel_order(OrderHandle h);
+    ErrorCode cancel_order(std::uint64_t order_id);
 
 private:
     ArraySideBook<false> bids_;   ///< Bid price levels (best bid at @c begin()).
@@ -136,6 +137,7 @@ private:
 
     Sink sink_;
     OrderPool pool_;
+    std::unordered_map<std::uint64_t, Order*> order_index_;
 
     template <Side S>
     [[gnu::always_inline]] auto& opposite_book() {

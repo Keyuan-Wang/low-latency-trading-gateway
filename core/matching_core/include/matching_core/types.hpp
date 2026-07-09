@@ -7,9 +7,6 @@ namespace llmes::matching_core {
 
 class PriceLevel;  // forward decl — full definition in price_level.hpp
 
-using OrderHandle = std::uint32_t;  // Direct index into the order pool.
-inline constexpr OrderHandle kInvalidHandle = UINT32_MAX;
-
 template <bool IsAsk>
 struct PriceCompare;
 
@@ -59,8 +56,6 @@ struct AddResult {
     std::uint64_t initial_quantity{0};   ///< Requested quantity at entry.
     std::uint64_t filled_quantity{0};      ///< Total matched quantity.
     std::uint64_t remaining_quantity{0};   ///< Unfilled quantity after matching / rest.
-
-    OrderHandle handle{kInvalidHandle};
 };
 
 
