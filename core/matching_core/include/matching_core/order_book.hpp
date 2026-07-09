@@ -10,7 +10,7 @@
 #include <map>
 #include <utility>
 #include <cstddef>  // std::byte, std::size_t
-#include <unordered_map>
+#include "absl/container/flat_hash_map.h"
 
 
 #include "types.hpp"
@@ -137,7 +137,7 @@ private:
 
     Sink sink_;
     OrderPool pool_;
-    std::unordered_map<std::uint64_t, Order*> order_index_;
+    absl::flat_hash_map<std::uint64_t, Order*> order_index_;
 
     template <Side S>
     [[gnu::always_inline]] auto& opposite_book() {
