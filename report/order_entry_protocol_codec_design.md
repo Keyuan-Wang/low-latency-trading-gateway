@@ -370,5 +370,5 @@ The module deliberately stops short of:
 - direct matching-engine integration.
 
 Those are useful systems topics, but they would expand the project sideways.
-For `llmes`, the stronger story is that the matching core is the low-latency
+For `low-latency-trading-gateway`, the stronger story is that the matching core is the low-latency
 hot path, while `order_entry` demonstrates the external binary protocol boundary.

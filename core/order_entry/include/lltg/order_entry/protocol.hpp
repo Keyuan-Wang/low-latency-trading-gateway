@@ -6,7 +6,7 @@
 
 namespace lltg::order_entry {
 
-inline constexpr std::uint32_t kMagic = 0x6c6c6d65; // "llme"
+inline constexpr std::uint32_t kMagic = 0x6c6c7467; // "lltg"
 
 inline constexpr std::uint16_t kVersion = 1;
 

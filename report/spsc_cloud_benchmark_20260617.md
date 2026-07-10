@@ -188,7 +188,7 @@ atomicv3 ██                                           30
 ## Appendix: Reproduction
 
 ```bash
-cd /root/llmes/core/SPSC
+cd /root/low-latency-trading-gateway/core/SPSC
 g++ -O3 -std=c++20 -pthread test.cpp -o test
 
 for mode in mutex atomicv1 atomicv2 atomicv3 atomicv4; do
