@@ -2,7 +2,7 @@
 
 **Low-latency trading gateway: epoll I/O, SPSC queues, and a fixed-frame order-entry protocol.**
 
-Split from the original [`llmes`](../llmes) monorepo (full git history preserved). The pure matching engine lives in the sibling repo **`llmes-orderbook`**. This repo does **not** depend on the order book.
+Split from the original [`llmes`](https://github.com/Keyuan-Wang/llmes) monorepo (full git history preserved). The pure matching engine lives in the sibling repo **`llmes-orderbook`**. This repo does **not** depend on the order book.
 
 ## What is in this repo
 
@@ -74,8 +74,8 @@ g++ -O3 -std=c++20 -pthread test.cpp -o test
 
 ## Related repos
 
-| Repo | Role |
-|---|---|
-| `llmes-gateway` (this) | epoll + SPSC + order-entry protocol |
-| `llmes-orderbook` | Pure matching engine (no networking) |
-| `llmes` | Archive of the original monorepo + `server_results` |
+| Repo | URL | Role |
+|---|---|---|
+| `llmes-gateway` (this) | https://github.com/Keyuan-Wang/llmes-gateway | epoll + SPSC + order-entry protocol |
+| `llmes-orderbook` | https://github.com/Keyuan-Wang/llmes-orderbook | Pure matching engine (no networking) |
+| `llmes` | https://github.com/Keyuan-Wang/llmes | Archive of the original monorepo + `server_results` |
