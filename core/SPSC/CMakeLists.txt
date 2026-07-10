@@ -4,7 +4,7 @@ target_include_directories(spsc INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-if(LLMES_BUILD_TESTS)
+if(LLTG_BUILD_TESTS)
   add_executable(spsc_tests test.cpp)
   target_link_libraries(spsc_tests PRIVATE spsc)
 

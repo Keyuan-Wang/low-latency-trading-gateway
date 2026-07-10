@@ -1,8 +1,8 @@
-# llmes-gateway
+# low-latency-trading-gateway
 
 **Low-latency trading gateway: epoll I/O, SPSC queues, and a fixed-frame order-entry protocol.**
 
-Split from the original [`llmes`](https://github.com/Keyuan-Wang/llmes) monorepo (full git history preserved). The pure matching engine lives in the sibling repo **`llmes-orderbook`**. This repo does **not** depend on the order book.
+The pure matching engine lives in the sibling repo **`low-latency-matching-engine`**. This repo does **not** depend on the order book.
 
 ## What is in this repo
 
@@ -15,7 +15,7 @@ report/             protocol design + SPSC cloud benchmark
 
 ## Protocol
 
-Fixed **64-byte** frames: 32B header + 32B payload (`llmes::order_entry`).
+Fixed **64-byte** frames: 32B header + 32B payload (`lltg::order_entry`).
 
 | Requests | Responses |
 |---|---|
@@ -33,23 +33,29 @@ See [`report/order_entry_protocol_codec_design.md`](report/order_entry_protocol_
 
 See [`report/spsc_cloud_benchmark_20260617.md`](report/spsc_cloud_benchmark_20260617.md).
 
-## Thread model (epoll prototype)
+## Thread model (epoll + SPSC + eventfd)
 
 ```text
-Gateway thread          SPSC cmd queue         Matching thread (stub)
-  parse / session   -->  EngineCommand     -->  map to EngineResponse
-  encode / send     <--  EngineResponse    <--  (no OrderBook yet)
-                    SPSC rsp queue + eventfd
+Client ←TCP→ Gateway thread ←SPSC→ Matching thread (stub)
+               │                        │
+         epoll + parse            process EngineCommand
+         encode + send            push EngineResponse
+               │                        │
+               └──── eventfd notify ────┘
 ```
 
-`order_entry_epoll_server` currently uses a **stub** matching thread. Wiring a real book belongs in a future integration layer and is intentionally out of this repo.
+- **Gateway thread**: epoll event loop, non-blocking accept, per-connection `FrameParser`, sequence validation, Heartbeat/Logout handling. Order messages are converted to `EngineCommand` and pushed to the SPSC command queue.
+- **Matching thread**: spin-polls the command queue, produces `EngineResponse`, writes `eventfd` to wake the gateway's `epoll_wait`.
+- **Session routing**: each connection holds a `SessionToken` (slot + generation). A `SessionSlot` array maps tokens back to fds for response delivery.
+
+The matching thread currently runs a **stub** engine. Wiring a real order book belongs in a future integration layer and is intentionally out of this repo.
 
 ## Build
 
 ```bash
 cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
-  -DLLMES_BUILD_TESTS=ON
+  -DLLTG_BUILD_TESTS=ON
 
 cmake --build build -j$(nproc)
 ctest --test-dir build --output-on-failure
@@ -58,10 +64,9 @@ ctest --test-dir build --output-on-failure
 Useful targets:
 
 ```bash
-cmake --build build --target order_entry_tests spsc_tests
-cmake --build build --target order_entry_blocking_server order_entry_blocking_client
-cmake --build build --target order_entry_epoll_server
-cmake --build build --target order_entry_echo_bench_server order_entry_echo_bench_client
+ctest --test-dir build --output-on-failure
+cmake --build build --target order_entry_epoll_server order_entry_epoll_bench_client
+cmake --build build --target spsc_tests
 ```
 
 Standalone SPSC microbench (optional):
@@ -76,6 +81,5 @@ g++ -O3 -std=c++20 -pthread test.cpp -o test
 
 | Repo | URL | Role |
 |---|---|---|
-| `llmes-gateway` (this) | https://github.com/Keyuan-Wang/llmes-gateway | epoll + SPSC + order-entry protocol |
-| `llmes-orderbook` | https://github.com/Keyuan-Wang/llmes-orderbook | Pure matching engine (no networking) |
-| `llmes` | https://github.com/Keyuan-Wang/llmes | Archive of the original monorepo + `server_results` |
+| `low-latency-trading-gateway` (this) | https://github.com/Keyuan-Wang/low-latency-trading-gateway | epoll + SPSC + order-entry protocol |
+| `low-latency-matching-engine` | https://github.com/Keyuan-Wang/low-latency-matching-engine | Pure matching engine (no networking) |

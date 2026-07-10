@@ -84,15 +84,15 @@ int main(int argc, char** argv) {
         argc >= 3 ? std::strtoull(argv[2], nullptr, 10) : 20'000'000ULL;
 
     using MutexQueue =
-        llmes::spsc::SpscRingBufferMutex<std::uint64_t, k_capacity>;
+        lltg::spsc::SpscRingBufferMutex<std::uint64_t, k_capacity>;
     using AtomicV1Queue =
-        llmes::spsc::SpscRingBufferAtomicV1<std::uint64_t, k_capacity>;
+        lltg::spsc::SpscRingBufferAtomicV1<std::uint64_t, k_capacity>;
     using AtomicV2Queue =
-        llmes::spsc::SpscRingBufferAtomicV2<std::uint64_t, k_capacity>;
+        lltg::spsc::SpscRingBufferAtomicV2<std::uint64_t, k_capacity>;
     using AtomicV3Queue =
-        llmes::spsc::SpscRingBufferAtomicV3<std::uint64_t, k_capacity>;
+        lltg::spsc::SpscRingBufferAtomicV3<std::uint64_t, k_capacity>;
     using AtomicV4Queue =
-        llmes::spsc::SpscRingBufferAtomicV4<std::uint64_t, k_capacity>;
+        lltg::spsc::SpscRingBufferAtomicV4<std::uint64_t, k_capacity>;
 
     if (mode == "mutex" || mode == "all") {
         run_benchmark<MutexQueue>("mutex", total);

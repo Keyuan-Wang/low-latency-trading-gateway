@@ -10,7 +10,7 @@
 
 // Explicit little-endian helpers
 
-namespace llmes::order_entry {
+namespace lltg::order_entry {
 
 [[gnu::always_inline]] inline void store_u16_le(std::span<std::byte> out, std::size_t offset, 
                                                 std::same_as<std::uint16_t> auto value) {

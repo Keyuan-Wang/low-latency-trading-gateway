@@ -1,14 +1,14 @@
 #pragma once
 
-#include "order_entry/codec.hpp"
-#include "order_entry/protocol.hpp"
+#include "lltg/order_entry/codec.hpp"
+#include "lltg/order_entry/protocol.hpp"
 
 #include <cstring>
 #include <array>
 #include <span>
 #include <bit>
 
-namespace llmes::order_entry {
+namespace lltg::order_entry {
 
 
 struct DecodedMessage {
@@ -165,4 +165,4 @@ inline FrameParser<Capacity>::Status FrameParser<Capacity>::try_parse(DecodedMes
     return Status::MessageReady;
 }
 
-}   // namespace llmes::order_entry
+}   // namespace lltg::order_entry

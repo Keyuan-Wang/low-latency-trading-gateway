@@ -4,7 +4,7 @@
 #include <cstddef>
 
 
-namespace llmes::order_entry {
+namespace lltg::order_entry {
 
 inline constexpr std::uint32_t kMagic = 0x6c6c6d65; // "llme"
 
@@ -195,4 +195,4 @@ struct Logout {
     std::uint64_t reserved4 = 0;
 };
 
-}   // namespace llmes::order_entry
+}   // namespace lltg::order_entry

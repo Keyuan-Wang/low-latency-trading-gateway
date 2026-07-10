@@ -1,12 +1,12 @@
 #pragma once
 
-#include "order_entry/protocol.hpp"
+#include "lltg/order_entry/protocol.hpp"
 
 #include <cstdint>
 #include <type_traits>
 
 
-namespace llmes::order_entry {
+namespace lltg::order_entry {
 
 struct SessionToken {
     std::uint32_t slot = 0;
@@ -59,4 +59,4 @@ static_assert(std::is_trivially_copyable_v<EngineCommand>);
 static_assert(std::is_trivially_copyable_v<EngineResponse>);
 
 
-}   // namespace llmes::order_entry
+}   // namespace lltg::order_entry

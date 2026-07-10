@@ -6,7 +6,7 @@
 #include <mutex>
 #include <utility>
 
-namespace llmes::spsc {
+namespace lltg::spsc {
 
 constexpr std::size_t k_cache_line_size = 64;
 
@@ -297,4 +297,4 @@ private:
     PaddedSize consumer_tail_;
 };
 
-} // namespace llmes::spsc
+}   // namespace lltg::spsc

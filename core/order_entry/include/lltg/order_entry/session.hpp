@@ -1,15 +1,15 @@
 #pragma once
 
-#include "order_entry/codec.hpp"
-#include "order_entry/frame_parser.hpp"
-#include "order_entry/protocol.hpp"
+#include "lltg/order_entry/codec.hpp"
+#include "lltg/order_entry/frame_parser.hpp"
+#include "lltg/order_entry/protocol.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <unordered_map>
 
-namespace llmes::order_entry {
+namespace lltg::order_entry {
 
 class OrderEntrySession {
 public:
@@ -214,4 +214,4 @@ inline void OrderEntrySession::encode_modify(const MessageHeader& request_header
     encode_modified(response_header, response, response_out);
 }
 
-} // namespace llmes::order_entry
+}   // namespace lltg::order_entry
